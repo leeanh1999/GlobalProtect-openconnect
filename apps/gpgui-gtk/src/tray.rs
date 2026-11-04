@@ -14,7 +14,9 @@ pub enum TrayCommand {
 
 pub struct VpnTray {
   status: VpnStatus,
+  failed: bool,
   portal: String,
+  icon_theme_path: String,
   tx: async_channel::Sender<TrayCommand>,
 }
 
@@ -34,7 +36,11 @@ impl ksni::Tray for VpnTray {
   }
 
   fn icon_name(&self) -> String {
-    self.status.icon_name().into()
+    self.status.icon_name(self.failed).into()
+  }
+
+  fn icon_theme_path(&self) -> String {
+    self.icon_theme_path.clone()
   }
 
   fn tool_tip(&self) -> ksni::ToolTip {
@@ -46,7 +52,7 @@ impl ksni::Tray for VpnTray {
     ksni::ToolTip {
       title: "GlobalProtect VPN".into(),
       description,
-      icon_name: self.status.icon_name().into(),
+      icon_name: self.status.icon_name(self.failed).into(),
       icon_pixmap: Vec::new(),
     }
   }
@@ -104,10 +110,12 @@ pub struct TrayHandle(Option<ksni::blocking::Handle<VpnTray>>);
 
 impl TrayHandle {
   /// Spawns the tray; returns a no-op handle when no StatusNotifier host is available.
-  pub fn spawn(tx: async_channel::Sender<TrayCommand>) -> Self {
+  pub fn spawn(tx: async_channel::Sender<TrayCommand>, icon_theme_path: Option<&std::path::Path>) -> Self {
     let tray = VpnTray {
       status: VpnStatus::Disconnected,
+      failed: false,
       portal: String::new(),
+      icon_theme_path: icon_theme_path.map(|p| p.display().to_string()).unwrap_or_default(),
       tx,
     };
     match tray.spawn() {
@@ -123,11 +131,12 @@ impl TrayHandle {
     self.0.is_some()
   }
 
-  pub fn update(&self, status: VpnStatus, portal: &str) {
+  pub fn update(&self, status: VpnStatus, failed: bool, portal: &str) {
     if let Some(handle) = &self.0 {
       let portal = portal.to_owned();
       handle.update(move |tray| {
         tray.status = status;
+        tray.failed = failed;
         tray.portal = portal;
       });
     }

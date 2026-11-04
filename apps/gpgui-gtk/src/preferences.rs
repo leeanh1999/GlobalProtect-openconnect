@@ -51,7 +51,12 @@ pub fn present(parent: &impl IsA<gtk::Widget>, s: Settings, on_close: impl Fn(Se
     s.ignore_tls_errors,
   );
   let connection = adw::PreferencesGroup::builder().title("Connection").build();
-  for row in [&as_gateway, &auto_gateway, &browser, &hip, &ignore_tls] {
+  let fix_openssl = switch(
+    "Legacy OpenSSL compatibility",
+    "For servers that need legacy TLS renegotiation (gpclient --fix-openssl)",
+    s.fix_openssl,
+  );
+  for row in [&as_gateway, &auto_gateway, &browser, &hip, &ignore_tls, &fix_openssl] {
     connection.add(row);
   }
 
@@ -130,6 +135,7 @@ pub fn present(parent: &impl IsA<gtk::Widget>, s: Settings, on_close: impl Fn(Se
       use_default_browser: browser.is_active(),
       hip: hip.is_active(),
       ignore_tls_errors: ignore_tls.is_active(),
+      fix_openssl: fix_openssl.is_active(),
       no_dtls: no_dtls.is_active(),
       disable_ipv6: ipv4_only.is_active(),
       mtu: mtu.value() as u32,

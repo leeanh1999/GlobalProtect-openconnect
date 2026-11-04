@@ -1,4 +1,5 @@
 mod config;
+mod icons;
 mod preferences;
 mod secrets;
 mod state;

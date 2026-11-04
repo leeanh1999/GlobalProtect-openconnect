@@ -20,6 +20,8 @@ use crate::config::Settings;
 
 /// Log line from gpclient that marks the tunnel as up (crates/openconnect/src/vpn.rs).
 const CONNECTED_MARKER: &str = "Connected to VPN";
+/// gpclient hint printed when the server needs legacy OpenSSL settings (crates/gpapi/src/clap/mod.rs).
+const FIX_OPENSSL_MARKER: &str = "--fix-openssl";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
@@ -31,9 +33,17 @@ pub enum LogLevel {
 
 #[derive(Debug, Clone)]
 pub enum VpnEvent {
-  Log { level: LogLevel, message: String },
+  Log {
+    level: LogLevel,
+    message: String,
+  },
   Connected,
-  Exited { success: bool, error: Option<String> },
+  /// The server needs `--fix-openssl` (legacy TLS renegotiation / ciphers).
+  NeedsFixOpenssl,
+  Exited {
+    success: bool,
+    error: Option<String>,
+  },
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +93,10 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
 /// Arguments for `gpclient` (excluding the binary itself).
 pub fn connect_args(settings: &Settings, req: &ConnectRequest) -> Vec<String> {
   let mut args: Vec<String> = Vec::new();
+  // Global flags must precede the subcommand.
+  if settings.fix_openssl {
+    args.push("--fix-openssl".into());
+  }
   if settings.ignore_tls_errors {
     args.push("--ignore-tls-errors".into());
   }
@@ -164,6 +178,9 @@ fn pump<R: Read + Send + 'static>(
       }
       if message.contains(CONNECTED_MARKER) {
         let _ = tx.send_blocking(VpnEvent::Connected);
+      }
+      if message.contains(FIX_OPENSSL_MARKER) {
+        let _ = tx.send_blocking(VpnEvent::NeedsFixOpenssl);
       }
       if tx.send_blocking(VpnEvent::Log { level, message }).is_err() {
         break;
@@ -303,6 +320,19 @@ mod tests {
     let args = connect_args(&settings, &req());
     assert_eq!(args[0], "--ignore-tls-errors");
     assert!(args.iter().position(|a| a == "connect").unwrap() > 0);
+  }
+
+  #[test]
+  fn fix_openssl_is_a_global_flag() {
+    let settings = Settings {
+      fix_openssl: true,
+      ..Default::default()
+    };
+    let args = connect_args(&settings, &req());
+    let fix = args.iter().position(|a| a == "--fix-openssl").unwrap();
+    let connect = args.iter().position(|a| a == "connect").unwrap();
+    assert!(fix < connect);
+    assert!(!connect_args(&Settings::default(), &req()).contains(&"--fix-openssl".to_string()));
   }
 
   #[test]

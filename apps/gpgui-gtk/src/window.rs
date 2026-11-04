@@ -8,7 +8,7 @@ use gtk::{gio, glib};
 
 use crate::{
   config::Settings,
-  preferences, secrets,
+  icons, preferences, secrets,
   state::VpnStatus,
   tray::{TrayCommand, TrayHandle},
   vpn::{self, ConnectRequest, LogLevel, VpnEvent},
@@ -41,6 +41,8 @@ pub struct App {
   running: Cell<bool>,
   user_disconnect: Cell<bool>,
   quit_after_disconnect: Cell<bool>,
+  /// gpclient asked for `--fix-openssl` during the current attempt.
+  needs_fix_openssl: Cell<bool>,
   last_error: RefCell<Option<String>>,
   tray: TrayHandle,
   vpn_tx: async_channel::Sender<VpnEvent>,
@@ -66,11 +68,13 @@ pub fn setup(app: &adw::Application) {
 impl App {
   fn new(app: &adw::Application) -> Rc<Self> {
     let settings = Settings::load();
+    let icon_root = icons::install();
+    load_style(icon_root.as_deref());
     let w = build_widgets(app, &settings);
 
     let (vpn_tx, vpn_rx) = async_channel::unbounded::<VpnEvent>();
     let (tray_tx, tray_rx) = async_channel::unbounded::<TrayCommand>();
-    let tray = TrayHandle::spawn(tray_tx);
+    let tray = TrayHandle::spawn(tray_tx, icon_root.as_deref());
 
     let this = Rc::new(Self {
       app: app.clone(),
@@ -80,6 +84,7 @@ impl App {
       running: Cell::new(false),
       user_disconnect: Cell::new(false),
       quit_after_disconnect: Cell::new(false),
+      needs_fix_openssl: Cell::new(false),
       last_error: RefCell::default(),
       tray,
       vpn_tx,
@@ -322,6 +327,7 @@ impl App {
     self.clear_log();
     self.last_error.replace(None);
     self.user_disconnect.set(false);
+    self.needs_fix_openssl.set(false);
     let settings = self.settings.borrow().clone();
     match vpn::spawn_connect(&gpclient, &settings, request, self.vpn_tx.clone()) {
       Ok(()) => {
@@ -378,9 +384,16 @@ impl App {
           self.set_status(VpnStatus::Connected);
         }
       }
+      VpnEvent::NeedsFixOpenssl => self.needs_fix_openssl.set(true),
       VpnEvent::Exited { success, error } => {
         self.running.set(false);
         let was_user = self.user_disconnect.replace(false);
+        if !success && !was_user && self.needs_fix_openssl.get() && self.enable_fix_openssl() {
+          self.toast("Server needs legacy OpenSSL mode — enabled it and retrying");
+          self.set_status(VpnStatus::Disconnected);
+          self.connect();
+          return;
+        }
         if !success && !was_user {
           let msg = error.unwrap_or_else(|| "Connection ended unexpectedly".into());
           self.last_error.replace(Some(msg.clone()));
@@ -396,12 +409,26 @@ impl App {
     }
   }
 
+  /// Turns on `fix_openssl`; returns false if it was already on (no point retrying).
+  fn enable_fix_openssl(&self) -> bool {
+    let mut s = self.settings.borrow_mut();
+    if s.fix_openssl {
+      return false;
+    }
+    s.fix_openssl = true;
+    if let Err(err) = s.save() {
+      log::warn!("Cannot save settings: {err:#}");
+    }
+    true
+  }
+
   fn set_status(&self, status: VpnStatus) {
     self.status.set(status);
     let w = &self.w;
     let portal = self.settings.borrow().profile.portal.clone();
 
-    w.status.set_icon_name(Some(status.icon_name()));
+    let failed = self.last_error.borrow().is_some();
+    w.status.set_icon_name(Some(status.icon_name(failed)));
     w.status.set_title(status.label());
     let description = match (status, self.last_error.borrow().as_deref()) {
       (VpnStatus::Disconnected, Some(err)) => glib::markup_escape_text(err).to_string(),
@@ -430,7 +457,7 @@ impl App {
     w.action.add_css_class(add);
 
     w.window.set_title(Some(&format!("GlobalProtect — {}", status.label())));
-    self.tray.update(status, &portal);
+    self.tray.update(status, failed, &portal);
   }
 
   // ---- log ----------------------------------------------------------------
@@ -486,7 +513,7 @@ impl App {
   fn show_about(&self) {
     let about = adw::AboutDialog::builder()
       .application_name("GlobalProtect VPN")
-      .application_icon("network-vpn")
+      .application_icon(icons::APP_ICON)
       .version(env!("CARGO_PKG_VERSION"))
       .license_type(gtk::License::Gpl30)
       .comments("Open-source GTK frontend for GlobalProtect-openconnect (gpclient).")
@@ -519,6 +546,22 @@ impl App {
     });
     dialog.present(Some(&self.w.window));
   }
+}
+
+/// Registers bundled icons and app CSS for the default display.
+fn load_style(icon_root: Option<&std::path::Path>) {
+  let Some(display) = gtk::gdk::Display::default() else {
+    return;
+  };
+  if let Some(root) = icon_root {
+    gtk::IconTheme::for_display(&display).add_search_path(root);
+  }
+  gtk::Window::set_default_icon_name(icons::APP_ICON);
+
+  // Full-colour status shields instead of libadwaita's dimmed status-page icon.
+  let css = gtk::CssProvider::new();
+  css.load_from_string("statuspage.vpn-status > scrolledwindow > viewport > box > .icon { opacity: 1; filter: none; }");
+  gtk::style_context_add_provider_for_display(&display, &css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
 }
 
 fn build_widgets(app: &adw::Application, settings: &Settings) -> Widgets {
@@ -589,8 +632,9 @@ fn build_widgets(app: &adw::Application, settings: &Settings) -> Widgets {
   body.append(&log_expander);
 
   let status = adw::StatusPage::builder()
-    .icon_name(VpnStatus::Disconnected.icon_name())
+    .icon_name(VpnStatus::Disconnected.icon_name(false))
     .title(VpnStatus::Disconnected.label())
+    .css_classes(["vpn-status"])
     .child(&adw::Clamp::builder().maximum_size(480).child(&body).build())
     .build();
 

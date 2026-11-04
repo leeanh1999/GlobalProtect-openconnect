@@ -16,11 +16,13 @@ impl VpnStatus {
     }
   }
 
-  pub fn icon_name(self) -> &'static str {
+  /// Bundled icon (see `icons.rs`); `failed` shows the error shield when disconnected.
+  pub fn icon_name(self, failed: bool) -> &'static str {
     match self {
-      VpnStatus::Connected => "network-vpn-symbolic",
-      VpnStatus::Connecting | VpnStatus::Disconnecting => "network-vpn-acquiring-symbolic",
-      VpnStatus::Disconnected => "network-vpn-disabled-symbolic",
+      VpnStatus::Connected => "gpgui-gtk-connected",
+      VpnStatus::Connecting | VpnStatus::Disconnecting => "gpgui-gtk-connecting",
+      VpnStatus::Disconnected if failed => "gpgui-gtk-error",
+      VpnStatus::Disconnected => "gpgui-gtk-disconnected",
     }
   }
 

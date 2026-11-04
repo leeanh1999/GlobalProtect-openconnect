@@ -2,7 +2,7 @@
 <!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN" "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
 <policyconfig>
   <vendor>gpgui-gtk</vendor>
-  <icon_name>network-vpn</icon_name>
+  <icon_name>io.github.gpgui_gtk.GpguiGtk</icon_name>
   <!-- Lets gpgui-gtk start/stop gpclient as root; auth is kept for a few minutes
        so Disconnect does not prompt again right after Connect. -->
   <action id="io.github.gpgui_gtk.gpclient">
