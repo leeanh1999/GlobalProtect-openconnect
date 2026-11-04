@@ -22,6 +22,10 @@ use crate::config::Settings;
 const CONNECTED_MARKER: &str = "Connected to VPN";
 /// gpclient hint printed when the server needs legacy OpenSSL settings (crates/gpapi/src/clap/mod.rs).
 const FIX_OPENSSL_MARKER: &str = "--fix-openssl";
+/// gpclient refuses to start while its lock file points to a live gpclient (apps/gpclient/src/cli.rs).
+const ANOTHER_INSTANCE_MARKER: &str = "Another instance of the client is already running";
+/// Process names that can hold the tunnel, the gpclient lock or an auth window.
+const VPN_PROCESS_NAMES: &[&str] = &["gpclient", "gpauth", "gpservice", "openconnect"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
@@ -40,6 +44,8 @@ pub enum VpnEvent {
   Connected,
   /// The server needs `--fix-openssl` (legacy TLS renegotiation / ciphers).
   NeedsFixOpenssl,
+  /// Another gpclient holds the lock file.
+  AnotherInstance,
   Exited {
     success: bool,
     error: Option<String>,
@@ -182,6 +188,9 @@ fn pump<R: Read + Send + 'static>(
       if message.contains(FIX_OPENSSL_MARKER) {
         let _ = tx.send_blocking(VpnEvent::NeedsFixOpenssl);
       }
+      if message.contains(ANOTHER_INSTANCE_MARKER) {
+        let _ = tx.send_blocking(VpnEvent::AnotherInstance);
+      }
       if tx.send_blocking(VpnEvent::Log { level, message }).is_err() {
         break;
       }
@@ -201,12 +210,13 @@ fn describe_exit(code: Option<i32>) -> Option<String> {
 }
 
 /// Start `pkexec gpclient … connect` and stream events to `tx` until it exits.
+/// Returns the child pid (pkexec execs gpclient in place, so it is gpclient's pid).
 pub fn spawn_connect(
   gpclient: &Path,
   settings: &Settings,
   req: ConnectRequest,
   tx: async_channel::Sender<VpnEvent>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<u32> {
   let args = connect_args(settings, &req);
   // The password travels on stdin only, so the argument list is safe to log.
   log::info!("Running pkexec {} {}", gpclient.display(), args.join(" "));
@@ -230,6 +240,7 @@ pub fn spawn_connect(
     drop(stdin);
   }
 
+  let pid = child.id();
   let out = pump(child.stdout.take().expect("piped stdout"), tx.clone());
   let err = pump(child.stderr.take().expect("piped stderr"), tx.clone());
 
@@ -253,6 +264,79 @@ pub fn spawn_connect(
     };
     let _ = tx.send_blocking(event);
   });
+  Ok(pid)
+}
+
+#[derive(Debug, Clone)]
+pub struct VpnProcess {
+  pub pid: u32,
+  pub name: String,
+  pub cmdline: String,
+}
+
+/// Running gpclient/gpauth/gpservice/openconnect processes, except `exclude`.
+pub fn find_vpn_processes(exclude: &[u32]) -> Vec<VpnProcess> {
+  let Ok(entries) = std::fs::read_dir("/proc") else {
+    return Vec::new();
+  };
+  let mut found: Vec<VpnProcess> = entries
+    .flatten()
+    .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+    .filter(|pid| *pid != std::process::id() && !exclude.contains(pid))
+    .filter_map(|pid| {
+      let name = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+      let name = name.trim();
+      if !VPN_PROCESS_NAMES.contains(&name) {
+        return None;
+      }
+      let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))
+        .map(|raw| String::from_utf8_lossy(&raw).replace('\0', " ").trim().to_owned())
+        .unwrap_or_default();
+      Some(VpnProcess {
+        pid,
+        name: name.to_owned(),
+        cmdline,
+      })
+    })
+    .collect();
+  found.sort_by_key(|p| p.pid);
+  found
+}
+
+/// Root helper run through pkexec: SIGINT (graceful disconnect), wait up to 5 s,
+/// then SIGKILL survivors and drop a stale gpclient lock. One auth prompt total.
+const KILL_SCRIPT: &str = r#"
+for p in "$@"; do kill -INT "$p" 2>/dev/null; done
+i=0
+while [ "$i" -lt 20 ]; do
+  alive=0
+  for p in "$@"; do kill -0 "$p" 2>/dev/null && alive=1; done
+  [ "$alive" = 0 ] && break
+  sleep 0.25
+  i=$((i + 1))
+done
+for p in "$@"; do kill -KILL "$p" 2>/dev/null; done
+rm -f /var/run/gpclient.lock /run/gpclient.lock
+exit 0
+"#;
+
+/// Blocking: stop the given processes as root.
+pub fn kill_processes(pids: &[u32]) -> anyhow::Result<()> {
+  if pids.is_empty() {
+    return Ok(());
+  }
+  let output = Command::new("pkexec")
+    .args(["/bin/sh", "-c", KILL_SCRIPT, "gpgui-gtk-kill"])
+    .args(pids.iter().map(u32::to_string))
+    .stdin(Stdio::null())
+    .output()
+    .context("Failed to start pkexec")?;
+  if !output.status.success() {
+    bail!(
+      "{}",
+      describe_exit(output.status.code()).unwrap_or_else(|| "Failed to stop processes".into())
+    );
+  }
   Ok(())
 }
 
@@ -357,6 +441,17 @@ mod tests {
     let (level, msg) = parse_line("Error executing command as another user");
     assert_eq!(level, LogLevel::Info);
     assert_eq!(msg, "Error executing command as another user");
+  }
+
+  #[test]
+  fn finds_processes_by_name_and_honours_exclusions() {
+    // Spawn something that is not a VPN process: must never be reported.
+    let mut child = Command::new("sleep").arg("5").spawn().unwrap();
+    let found = find_vpn_processes(&[]);
+    assert!(found.iter().all(|p| VPN_PROCESS_NAMES.contains(&p.name.as_str())));
+    assert!(found.iter().all(|p| p.pid != child.id() && p.pid != std::process::id()));
+    child.kill().ok();
+    child.wait().ok();
   }
 
   #[test]

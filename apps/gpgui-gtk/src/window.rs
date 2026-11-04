@@ -43,6 +43,10 @@ pub struct App {
   quit_after_disconnect: Cell<bool>,
   /// gpclient asked for `--fix-openssl` during the current attempt.
   needs_fix_openssl: Cell<bool>,
+  /// gpclient refused to start because another instance holds its lock.
+  another_instance: Cell<bool>,
+  /// pid of our own gpclient, never offered for killing.
+  child_pid: Cell<Option<u32>>,
   last_error: RefCell<Option<String>>,
   tray: TrayHandle,
   vpn_tx: async_channel::Sender<VpnEvent>,
@@ -74,7 +78,7 @@ impl App {
 
     let (vpn_tx, vpn_rx) = async_channel::unbounded::<VpnEvent>();
     let (tray_tx, tray_rx) = async_channel::unbounded::<TrayCommand>();
-    let tray = TrayHandle::spawn(tray_tx, icon_root.as_deref());
+    let tray = TrayHandle::spawn(tray_tx, icons::tray_pixmaps());
 
     let this = Rc::new(Self {
       app: app.clone(),
@@ -85,6 +89,8 @@ impl App {
       user_disconnect: Cell::new(false),
       quit_after_disconnect: Cell::new(false),
       needs_fix_openssl: Cell::new(false),
+      another_instance: Cell::new(false),
+      child_pid: Cell::new(None),
       last_error: RefCell::default(),
       tray,
       vpn_tx,
@@ -147,6 +153,15 @@ impl App {
       .build();
 
     let weak = Rc::downgrade(self);
+    let stop_others = gio::ActionEntry::builder("stop-others")
+      .activate(move |_: &adw::Application, _, _| {
+        if let Some(this) = weak.upgrade() {
+          this.stop_others();
+        }
+      })
+      .build();
+
+    let weak = Rc::downgrade(self);
     let about = gio::ActionEntry::builder("about")
       .activate(move |_: &adw::Application, _, _| {
         if let Some(this) = weak.upgrade() {
@@ -164,7 +179,7 @@ impl App {
       })
       .build();
 
-    self.app.add_action_entries([prefs, about, quit]);
+    self.app.add_action_entries([prefs, stop_others, about, quit]);
     self.app.set_accels_for_action("app.quit", &["<Control>q"]);
     self.app.set_accels_for_action("app.preferences", &["<Control>comma"]);
   }
@@ -297,7 +312,20 @@ impl App {
 
   // ---- connection ---------------------------------------------------------
 
-  fn connect(&self) {
+  /// Connects, first offering to stop VPN processes left by another client/GUI.
+  fn connect(self: &Rc<Self>) {
+    if self.running.get() {
+      return;
+    }
+    let others = vpn::find_vpn_processes(&[]);
+    if others.is_empty() {
+      self.start_connect();
+    } else {
+      self.confirm_stop_others(others, true);
+    }
+  }
+
+  fn start_connect(&self) {
     if self.running.get() {
       return;
     }
@@ -328,9 +356,11 @@ impl App {
     self.last_error.replace(None);
     self.user_disconnect.set(false);
     self.needs_fix_openssl.set(false);
+    self.another_instance.set(false);
     let settings = self.settings.borrow().clone();
     match vpn::spawn_connect(&gpclient, &settings, request, self.vpn_tx.clone()) {
-      Ok(()) => {
+      Ok(pid) => {
+        self.child_pid.set(Some(pid));
         self.running.set(true);
         self.set_status(VpnStatus::Connecting);
       }
@@ -371,7 +401,80 @@ impl App {
     });
   }
 
-  fn on_vpn_event(&self, event: VpnEvent) {
+  /// Menu action: list and stop VPN processes not started by this window.
+  fn stop_others(self: &Rc<Self>) {
+    let own: Vec<u32> = self
+      .child_pid
+      .get()
+      .filter(|_| self.running.get())
+      .into_iter()
+      .collect();
+    let others = vpn::find_vpn_processes(&own);
+    if others.is_empty() {
+      self.toast("No other VPN processes are running");
+    } else {
+      self.confirm_stop_others(others, false);
+    }
+  }
+
+  fn confirm_stop_others(self: &Rc<Self>, others: Vec<vpn::VpnProcess>, then_connect: bool) {
+    self.show();
+    let list = others
+      .iter()
+      .map(|p| {
+        let cmd: String = p.cmdline.chars().take(80).collect();
+        format!("• {} (pid {})  {}", p.name, p.pid, glib::markup_escape_text(&cmd))
+      })
+      .collect::<Vec<_>>()
+      .join("\n");
+    let dialog = adw::AlertDialog::new(
+      Some("Other VPN processes are running"),
+      Some(&format!(
+        "They can hold the gpclient lock or the tunnel and block a new connection:\n\n{list}"
+      )),
+    );
+    let stop_label = if then_connect {
+      "Stop & Connect"
+    } else {
+      "Stop Processes"
+    };
+    dialog.add_responses(&[("cancel", "Cancel"), ("stop", stop_label)]);
+    dialog.set_response_appearance("stop", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("stop"));
+    dialog.set_close_response("cancel");
+
+    let pids: Vec<u32> = others.iter().map(|p| p.pid).collect();
+    let weak = Rc::downgrade(self);
+    dialog.connect_response(None, move |_, response| {
+      if response != "stop" {
+        return;
+      }
+      let pids = pids.clone();
+      let weak = weak.clone();
+      glib::spawn_future_local(async move {
+        let result = gio::spawn_blocking(move || vpn::kill_processes(&pids)).await;
+        let Some(this) = weak.upgrade() else { return };
+        match result {
+          Ok(Ok(())) => {
+            let left = vpn::find_vpn_processes(&[]);
+            if left.is_empty() {
+              this.toast("Stopped other VPN processes");
+              if then_connect {
+                this.start_connect();
+              }
+            } else {
+              this.toast(&format!("{} process(es) are still running", left.len()));
+            }
+          }
+          Ok(Err(err)) => this.toast(&format!("Cannot stop processes: {err:#}")),
+          Err(_) => this.toast("Stopping processes panicked"),
+        }
+      });
+    });
+    dialog.present(Some(&self.w.window));
+  }
+
+  fn on_vpn_event(self: &Rc<Self>, event: VpnEvent) {
     match event {
       VpnEvent::Log { level, message } => {
         if level == LogLevel::Error {
@@ -385,6 +488,7 @@ impl App {
         }
       }
       VpnEvent::NeedsFixOpenssl => self.needs_fix_openssl.set(true),
+      VpnEvent::AnotherInstance => self.another_instance.set(true),
       VpnEvent::Exited { success, error } => {
         self.running.set(false);
         let was_user = self.user_disconnect.replace(false);
@@ -393,6 +497,14 @@ impl App {
           self.set_status(VpnStatus::Disconnected);
           self.connect();
           return;
+        }
+        if !success && !was_user && self.another_instance.get() {
+          self.set_status(VpnStatus::Disconnected);
+          let others = vpn::find_vpn_processes(&[]);
+          if !others.is_empty() {
+            self.confirm_stop_others(others, true);
+            return;
+          }
         }
         if !success && !was_user {
           let msg = error.unwrap_or_else(|| "Connection ended unexpectedly".into());
@@ -645,6 +757,7 @@ fn build_widgets(app: &adw::Application, settings: &Settings) -> Widgets {
 
   let menu = gio::Menu::new();
   menu.append(Some("_Preferences"), Some("app.preferences"));
+  menu.append(Some("_Stop Other VPN Processes…"), Some("app.stop-others"));
   menu.append(Some("_About"), Some("app.about"));
   menu.append(Some("_Quit"), Some("app.quit"));
   let menu_button = gtk::MenuButton::builder()

@@ -1,5 +1,7 @@
 //! StatusNotifierItem tray icon (KDE, GNOME with AppIndicator extension, …).
 
+use std::{collections::HashMap, sync::Arc};
+
 use ksni::blocking::TrayMethods;
 
 use crate::state::VpnStatus;
@@ -16,11 +18,16 @@ pub struct VpnTray {
   status: VpnStatus,
   failed: bool,
   portal: String,
-  icon_theme_path: String,
+  pixmaps: Arc<HashMap<&'static str, Vec<ksni::Icon>>>,
   tx: async_channel::Sender<TrayCommand>,
 }
 
 impl VpnTray {
+  fn current_pixmap(&self) -> Vec<ksni::Icon> {
+    let name = self.status.icon_name(self.failed);
+    self.pixmaps.get(name).cloned().unwrap_or_default()
+  }
+
   fn send(&self, cmd: TrayCommand) {
     let _ = self.tx.send_blocking(cmd);
   }
@@ -35,12 +42,14 @@ impl ksni::Tray for VpnTray {
     "GlobalProtect VPN".into()
   }
 
+  // No icon name on purpose: hosts that cannot resolve it show "…" instead of
+  // falling back to the pixmap. See `icons::tray_pixmaps`.
   fn icon_name(&self) -> String {
-    self.status.icon_name(self.failed).into()
+    String::new()
   }
 
-  fn icon_theme_path(&self) -> String {
-    self.icon_theme_path.clone()
+  fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+    self.current_pixmap()
   }
 
   fn tool_tip(&self) -> ksni::ToolTip {
@@ -52,8 +61,8 @@ impl ksni::Tray for VpnTray {
     ksni::ToolTip {
       title: "GlobalProtect VPN".into(),
       description,
-      icon_name: self.status.icon_name(self.failed).into(),
-      icon_pixmap: Vec::new(),
+      icon_name: String::new(),
+      icon_pixmap: self.current_pixmap(),
     }
   }
 
@@ -110,12 +119,12 @@ pub struct TrayHandle(Option<ksni::blocking::Handle<VpnTray>>);
 
 impl TrayHandle {
   /// Spawns the tray; returns a no-op handle when no StatusNotifier host is available.
-  pub fn spawn(tx: async_channel::Sender<TrayCommand>, icon_theme_path: Option<&std::path::Path>) -> Self {
+  pub fn spawn(tx: async_channel::Sender<TrayCommand>, pixmaps: HashMap<&'static str, Vec<ksni::Icon>>) -> Self {
     let tray = VpnTray {
       status: VpnStatus::Disconnected,
       failed: false,
       portal: String::new(),
-      icon_theme_path: icon_theme_path.map(|p| p.display().to_string()).unwrap_or_default(),
+      pixmaps: Arc::new(pixmaps),
       tx,
     };
     match tray.spawn() {
