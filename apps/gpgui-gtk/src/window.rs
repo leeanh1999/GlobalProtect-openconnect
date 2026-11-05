@@ -4,14 +4,18 @@ use std::{
 };
 
 use adw::prelude::*;
+use gpapi::service::vpn_state::VpnState;
 use gtk::{gio, glib};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
+  auth::{self, AuthInput, AuthUi},
   config::Settings,
   icons, preferences, secrets,
+  service::{self, ServiceCommand, ServiceEvent, ServiceHandle},
   state::VpnStatus,
   tray::{TrayCommand, TrayHandle},
-  vpn::{self, ConnectRequest, LogLevel, VpnEvent},
+  vpn::{self, LogLevel},
 };
 
 const MAX_LOG_LINES: i32 = 2000;
@@ -33,35 +37,50 @@ struct Widgets {
   action: gtk::Button,
 }
 
+/// Outcome of one sign-in + Connect attempt, reported back to the GTK thread.
+enum AttemptEvent {
+  Log(LogLevel, String),
+  /// The service accepted the Connect request for this gateway.
+  Accepted(String),
+  Failed {
+    error: String,
+    cancelled: bool,
+  },
+  /// MFA prompt; reply on the channel (`None` = cancel).
+  Otp(String, async_channel::Sender<Option<String>>),
+}
+
 pub struct App {
   app: adw::Application,
   w: Widgets,
   settings: RefCell<Settings>,
   status: Cell<VpnStatus>,
-  /// gpclient process is alive (from spawn until its Exited event).
-  running: Cell<bool>,
+  /// Tokio runtime for networking (auth, gpservice transport).
+  rt: tokio::runtime::Runtime,
+  service: RefCell<Option<ServiceHandle>>,
+  service_tx: async_channel::Sender<ServiceEvent>,
+  attempt_tx: async_channel::Sender<AttemptEvent>,
+  /// Sign-in in progress; cancelling it aborts gpauth/HTTP requests.
+  auth_cancel: RefCell<Option<CancellationToken>>,
+  /// gpservice owns a tunnel attempt we started (Connect accepted).
+  tunnel_requested: Cell<bool>,
+  gateway_name: RefCell<String>,
+  /// `restart_of` for the next Connect, when gpservice asked for re-authentication.
+  restart_of: Cell<Option<u64>>,
   user_disconnect: Cell<bool>,
-  quit_after_disconnect: Cell<bool>,
-  /// gpclient asked for `--fix-openssl` during the current attempt.
-  needs_fix_openssl: Cell<bool>,
-  /// gpclient refused to start because another instance holds its lock.
-  another_instance: Cell<bool>,
-  /// pid of our own gpclient, never offered for killing.
-  child_pid: Cell<Option<u32>>,
   last_error: RefCell<Option<String>>,
   /// Connection log, shown on demand from the menu.
   log: gtk::TextBuffer,
   log_view: RefCell<Option<glib::WeakRef<gtk::TextView>>>,
-  /// The current gpclient run reached "Connected".
+  /// The current attempt reached "Connected".
   was_connected: Cell<bool>,
-  /// The current gpclient run is an automatic reconnect.
+  /// The current attempt is an automatic reconnect.
   reconnecting: Cell<bool>,
   /// Failed reconnect attempts in a row.
   reconnect_failures: Cell<u32>,
   reconnect_remaining: Cell<u32>,
   reconnect_timer: RefCell<Option<glib::SourceId>>,
   tray: TrayHandle,
-  vpn_tx: async_channel::Sender<VpnEvent>,
   _hold: RefCell<Option<gio::ApplicationHoldGuard>>,
 }
 
@@ -88,7 +107,13 @@ impl App {
     load_icons(icons::install().as_deref());
     let w = build_widgets(app, &settings);
 
-    let (vpn_tx, vpn_rx) = async_channel::unbounded::<VpnEvent>();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+      .worker_threads(2)
+      .enable_all()
+      .build()
+      .expect("tokio runtime");
+    let (service_tx, service_rx) = async_channel::unbounded::<ServiceEvent>();
+    let (attempt_tx, attempt_rx) = async_channel::unbounded::<AttemptEvent>();
     let (tray_tx, tray_rx) = async_channel::unbounded::<TrayCommand>();
     let tray = TrayHandle::spawn(tray_tx, icons::tray_pixmaps());
 
@@ -97,12 +122,15 @@ impl App {
       w,
       settings: RefCell::new(settings),
       status: Cell::new(VpnStatus::Disconnected),
-      running: Cell::new(false),
+      rt,
+      service: RefCell::default(),
+      service_tx,
+      attempt_tx,
+      auth_cancel: RefCell::default(),
+      tunnel_requested: Cell::new(false),
+      gateway_name: RefCell::default(),
+      restart_of: Cell::new(None),
       user_disconnect: Cell::new(false),
-      quit_after_disconnect: Cell::new(false),
-      needs_fix_openssl: Cell::new(false),
-      another_instance: Cell::new(false),
-      child_pid: Cell::new(None),
       last_error: RefCell::default(),
       log: gtk::TextBuffer::new(None),
       log_view: RefCell::default(),
@@ -112,7 +140,6 @@ impl App {
       reconnect_remaining: Cell::new(0),
       reconnect_timer: RefCell::default(),
       tray,
-      vpn_tx,
       _hold: RefCell::new(Some(app.hold())),
     });
 
@@ -124,9 +151,17 @@ impl App {
 
     let weak = Rc::downgrade(&this);
     glib::spawn_future_local(async move {
-      while let Ok(event) = vpn_rx.recv().await {
+      while let Ok(event) = service_rx.recv().await {
         let Some(this) = weak.upgrade() else { break };
-        this.on_vpn_event(event);
+        this.on_service_event(event);
+      }
+    });
+
+    let weak = Rc::downgrade(&this);
+    glib::spawn_future_local(async move {
+      while let Ok(event) = attempt_rx.recv().await {
+        let Some(this) = weak.upgrade() else { break };
+        this.on_attempt_event(event);
       }
     });
 
@@ -147,6 +182,16 @@ impl App {
     });
 
     this
+  }
+
+  /// Signing in, or gpservice busy with a tunnel we asked for.
+  fn is_active(&self) -> bool {
+    self.auth_cancel.borrow().is_some()
+      || self.tunnel_requested.get()
+      || matches!(
+        self.status.get(),
+        VpnStatus::Connected | VpnStatus::Disconnecting | VpnStatus::Reconnecting
+      )
   }
 
   /// Dev aid: `GPGUI_GTK_SCREENSHOT=out.png [GPGUI_GTK_DEMO=state]` renders the
@@ -276,7 +321,7 @@ impl App {
     let weak = Rc::downgrade(self);
     self.w.action.connect_clicked(move |_| {
       if let Some(this) = weak.upgrade() {
-        if this.running.get() || this.status.get() == VpnStatus::Reconnecting {
+        if this.is_active() {
           this.disconnect();
         } else {
           this.connect();
@@ -402,12 +447,14 @@ impl App {
 
   /// Connects, first offering to stop VPN processes left by another client/GUI.
   fn connect(self: &Rc<Self>) {
-    if self.running.get() {
+    if self.is_active() {
       return;
     }
     self.cancel_reconnect();
     self.reconnect_failures.set(0);
-    let others = vpn::find_vpn_processes(&[]);
+    self.restart_of.set(None);
+    let own = self.own_service_pid();
+    let others = vpn::find_vpn_processes(&own);
     if others.is_empty() {
       self.start_connect();
     } else {
@@ -415,8 +462,33 @@ impl App {
     }
   }
 
+  fn own_service_pid(&self) -> Vec<u32> {
+    self
+      .service
+      .borrow()
+      .as_ref()
+      .filter(|s| s.is_alive())
+      .and_then(|s| s.pid)
+      .into_iter()
+      .collect()
+  }
+
+  /// Starts gpservice on first use (pkexec; no password with the upstream polkit policy).
+  fn ensure_service(&self) -> anyhow::Result<tokio::sync::mpsc::UnboundedSender<ServiceCommand>> {
+    if let Some(handle) = self.service.borrow().as_ref().filter(|s| s.is_alive()) {
+      return Ok(handle.sender());
+    }
+    let path = service::resolve_gpservice(&self.settings.borrow().gpservice_path)?;
+    self.append_log(LogLevel::Info, &format!("Starting {}", path.display()));
+    let handle = service::start(self.rt.handle(), path, self.service_tx.clone())?;
+    let sender = handle.sender();
+    self.service.replace(Some(handle));
+    Ok(sender)
+  }
+
+  /// Signs in (in the user session) and asks gpservice to open the tunnel.
   fn start_connect(&self) {
-    if self.running.get() {
+    if self.auth_cancel.borrow().is_some() || self.tunnel_requested.get() {
       return;
     }
     let portal = self.w.portal.text().trim().to_owned();
@@ -425,8 +497,8 @@ impl App {
       self.w.portal.grab_focus();
       return;
     }
-    let gpclient = match vpn::resolve_gpclient(&self.settings.borrow()) {
-      Ok(path) => path,
+    let service = match self.ensure_service() {
+      Ok(service) => service,
       Err(err) => {
         self.toast(&format!("{err:#}"));
         return;
@@ -435,11 +507,12 @@ impl App {
 
     self.persist_form();
     let opt = |s: glib::GString| Some(s.trim().to_owned()).filter(|s| !s.is_empty());
-    let request = ConnectRequest {
-      portal,
+    let input = AuthInput {
+      portal: portal.clone(),
       gateway: opt(self.w.gateway.text()),
       username: opt(self.w.username.text()),
       password: Some(self.w.password.text().to_string()).filter(|p| !p.is_empty()),
+      settings: self.settings.borrow().clone(),
     };
 
     let verb = if self.reconnecting.get() {
@@ -447,76 +520,104 @@ impl App {
     } else {
       "Connecting to"
     };
-    self.append_log(LogLevel::Info, &format!("──── {verb} {} ────", request.portal));
+    self.append_log(LogLevel::Info, &format!("──── {verb} {portal} ────"));
     self.was_connected.set(false);
+    self.user_disconnect.set(false);
     if !self.reconnecting.get() {
       self.last_error.replace(None);
     }
-    self.user_disconnect.set(false);
-    self.needs_fix_openssl.set(false);
-    self.another_instance.set(false);
-    let settings = self.settings.borrow().clone();
-    match vpn::spawn_connect(&gpclient, &settings, request, self.vpn_tx.clone()) {
-      Ok(pid) => {
-        self.child_pid.set(Some(pid));
-        self.running.set(true);
-        self.set_status(VpnStatus::Connecting);
+    self.gateway_name.replace(String::new());
+    let cancel = CancellationToken::new();
+    self.auth_cancel.replace(Some(cancel.clone()));
+    self.set_status(VpnStatus::Connecting);
+
+    let restart_of = self.restart_of.take();
+    let events = self.attempt_tx.clone();
+    self.rt.spawn(async move {
+      let log_tx = events.clone();
+      let otp_tx = events.clone();
+      let ui = AuthUi {
+        log: Box::new(move |msg| {
+          let _ = log_tx.try_send(AttemptEvent::Log(LogLevel::Info, msg));
+        }),
+        ask_otp: Box::new(move |message| {
+          let (reply, rx) = async_channel::bounded(1);
+          let _ = otp_tx.try_send(AttemptEvent::Otp(message, reply));
+          rx
+        }),
+      };
+      let outcome = async {
+        let authenticated = auth::authenticate(&input, &ui, &cancel).await?;
+        let gateway = authenticated.gateway_name.clone();
+        let request = authenticated.request.with_restart_of(restart_of);
+        let (reply, accepted) = tokio::sync::oneshot::channel();
+        ui_log(&events, format!("Asking gpservice to connect to {gateway}"));
+        let sent = service.send(ServiceCommand::Connect(Box::new(request), reply)).is_ok();
+        let result = if sent {
+          accepted
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("gpservice stopped")))
+        } else {
+          Err(anyhow::anyhow!("gpservice is not running"))
+        };
+        match result {
+          // The service now owns the gateway sessions (and logs them out itself).
+          Ok(()) => {
+            authenticated.sessions.relinquish();
+            Ok(gateway)
+          }
+          Err(err) => {
+            authenticated.sessions.logout().await;
+            Err(err.context("gpservice refused the connection"))
+          }
+        }
       }
-      Err(err) => self.toast(&format!("{err:#}")),
-    }
+      .await;
+      let event = match outcome {
+        Ok(gateway) => AttemptEvent::Accepted(gateway),
+        Err(err) => AttemptEvent::Failed {
+          cancelled: err.downcast_ref::<gpapi::auth::AuthenticationCancelled>().is_some() || cancel.is_cancelled(),
+          error: format!("{err:#}"),
+        },
+      };
+      let _ = events.send(event).await;
+    });
   }
 
   fn disconnect(self: &Rc<Self>) {
-    if !self.running.get() && self.status.get() == VpnStatus::Reconnecting {
-      self.cancel_reconnect();
-      self.last_error.replace(None);
-      self.set_status(VpnStatus::Disconnected);
-      if self.quit_after_disconnect.get() {
-        self.app.quit();
-      }
-      return;
-    }
-    if !self.running.get() || self.status.get() == VpnStatus::Disconnecting {
-      return;
-    }
-    let gpclient = match vpn::resolve_gpclient(&self.settings.borrow()) {
-      Ok(path) => path,
-      Err(err) => {
-        self.toast(&format!("{err:#}"));
+    match self.status.get() {
+      VpnStatus::Reconnecting => {
+        self.cancel_reconnect();
+        self.last_error.replace(None);
+        self.set_status(VpnStatus::Disconnected);
         return;
       }
-    };
-    let previous = self.status.get();
+      VpnStatus::Disconnecting => return,
+      _ => {}
+    }
     self.user_disconnect.set(true);
-    self.set_status(VpnStatus::Disconnecting);
-
-    let weak = Rc::downgrade(self);
-    glib::spawn_future_local(async move {
-      let result = gio::spawn_blocking(move || vpn::disconnect(&gpclient)).await;
-      let Some(this) = weak.upgrade() else { return };
-      let error = match result {
-        Ok(Ok(())) => return, // the Exited event finishes the transition
-        Ok(Err(err)) => format!("{err:#}"),
-        Err(_) => "Disconnect panicked".to_owned(),
-      };
-      if this.running.get() {
-        this.user_disconnect.set(false);
-        this.quit_after_disconnect.set(false);
-        this.set_status(previous);
+    if let Some(cancel) = self.auth_cancel.borrow().as_ref() {
+      self.append_log(LogLevel::Info, "Sign-in cancelled");
+      cancel.cancel();
+    }
+    if self.tunnel_requested.get() || self.status.get() == VpnStatus::Connected {
+      let sent = self
+        .service
+        .borrow()
+        .as_ref()
+        .is_some_and(|s| s.send(ServiceCommand::Disconnect));
+      if sent {
+        self.set_status(VpnStatus::Disconnecting);
+      } else {
+        self.tunnel_requested.set(false);
+        self.set_status(VpnStatus::Disconnected);
       }
-      this.toast(&format!("Disconnect failed: {error}"));
-    });
+    }
   }
 
   /// Menu action: list and stop VPN processes not started by this window.
   fn stop_others(self: &Rc<Self>) {
-    let own: Vec<u32> = self
-      .child_pid
-      .get()
-      .filter(|_| self.running.get())
-      .into_iter()
-      .collect();
-    let others = vpn::find_vpn_processes(&own);
+    let others = vpn::find_vpn_processes(&self.own_service_pid());
     if others.is_empty() {
       self.toast("No other VPN processes are running");
     } else {
@@ -537,7 +638,7 @@ impl App {
     let dialog = adw::AlertDialog::new(
       Some("Other VPN processes are running"),
       Some(&format!(
-        "They can hold the gpclient lock or the tunnel and block a new connection:\n\n{list}"
+        "They can hold the gpservice/gpclient lock or the tunnel and block a new connection:\n\n{list}"
       )),
     );
     let stop_label = if then_connect {
@@ -563,7 +664,7 @@ impl App {
         let Some(this) = weak.upgrade() else { return };
         match result {
           Ok(Ok(())) => {
-            let left = vpn::find_vpn_processes(&[]);
+            let left = vpn::find_vpn_processes(&this.own_service_pid());
             if left.is_empty() {
               this.toast("Stopped other VPN processes");
               if then_connect {
@@ -581,80 +682,193 @@ impl App {
     dialog.present(Some(&self.w.window));
   }
 
-  fn on_vpn_event(self: &Rc<Self>, event: VpnEvent) {
+  // ---- events -------------------------------------------------------------
+
+  fn on_attempt_event(self: &Rc<Self>, event: AttemptEvent) {
     match event {
-      VpnEvent::Log { level, message } => {
-        if level == LogLevel::Error {
-          self.last_error.replace(Some(message.clone()));
+      AttemptEvent::Log(level, message) => self.append_log(level, &message),
+      AttemptEvent::Otp(message, reply) => self.ask_otp(&message, reply),
+      AttemptEvent::Accepted(gateway) => {
+        self.auth_cancel.replace(None);
+        self.tunnel_requested.set(true);
+        self.append_log(
+          LogLevel::Info,
+          &format!("gpservice accepted the connection to {gateway}"),
+        );
+        self.gateway_name.replace(gateway);
+        if self.status.get() != VpnStatus::Connected {
+          self.set_status(VpnStatus::Connecting);
         }
-        self.append_log(level, &message);
       }
-      VpnEvent::Connected => {
-        self.was_connected.set(true);
-        self.reconnecting.set(false);
-        self.reconnect_failures.set(0);
-        self.last_error.replace(None);
-        if self.status.get() != VpnStatus::Disconnecting {
-          self.set_status(VpnStatus::Connected);
-        }
-      }
-      VpnEvent::NeedsFixOpenssl => self.needs_fix_openssl.set(true),
-      VpnEvent::AnotherInstance => self.another_instance.set(true),
-      VpnEvent::Exited { success, error } => {
-        self.running.set(false);
-        let was_user = self.user_disconnect.replace(false);
-        if !success && !was_user && self.needs_fix_openssl.get() && self.enable_fix_openssl() {
-          self.toast("Server needs legacy OpenSSL mode — enabled it and retrying");
-          self.set_status(VpnStatus::Disconnected);
-          self.connect();
-          return;
-        }
-        if !success && !was_user && self.another_instance.get() {
-          self.set_status(VpnStatus::Disconnected);
-          let others = vpn::find_vpn_processes(&[]);
-          if !others.is_empty() {
-            self.confirm_stop_others(others, true);
-            return;
-          }
-        }
-        let dropped = self.was_connected.replace(false);
-        if !was_user && !self.quit_after_disconnect.get() && (dropped || self.reconnecting.get()) {
-          // A dropped session starts a fresh series; a failed retry counts against the limit.
-          let failures = if dropped { 0 } else { self.reconnect_failures.get() + 1 };
-          self.reconnect_failures.set(failures);
-          if let (false, Some(err)) = (success, &error) {
-            self.last_error.replace(Some(err.clone()));
-          }
-          if self.settings.borrow().may_reconnect(failures) {
-            self.schedule_reconnect();
-            return;
-          }
+      AttemptEvent::Failed { error, cancelled } => {
+        self.auth_cancel.replace(None);
+        let was_user = self.user_disconnect.replace(false) || cancelled;
+        self.append_log(
+          if was_user { LogLevel::Info } else { LogLevel::Error },
+          &if was_user {
+            "Sign-in cancelled".to_owned()
+          } else {
+            error.clone()
+          },
+        );
+        if was_user {
           self.reconnecting.set(false);
-          if failures > 0 {
-            let msg = format!("Gave up reconnecting after {failures} attempts");
-            self.append_log(LogLevel::Error, &msg);
-            self.last_error.replace(Some(msg.clone()));
-            self.toast(&msg);
-            self.set_status(VpnStatus::Disconnected);
-            return;
-          }
-        }
-        if !success && !was_user {
-          let msg = error.unwrap_or_else(|| "Connection ended unexpectedly".into());
-          self.last_error.replace(Some(msg.clone()));
-          self.toast(&msg);
-        } else {
           self.last_error.replace(None);
-        }
-        self.set_status(VpnStatus::Disconnected);
-        if self.quit_after_disconnect.get() {
-          self.app.quit();
+          self.set_status(VpnStatus::Disconnected);
+        } else if is_legacy_tls_error(&error) && self.enable_fix_openssl() {
+          self.set_status(VpnStatus::Disconnected);
+          self.offer_restart_for_openssl();
+        } else {
+          self.attempt_failed(error);
         }
       }
     }
   }
 
-  /// Turns on `fix_openssl`; returns false if it was already on (no point retrying).
+  fn on_service_event(self: &Rc<Self>, event: ServiceEvent) {
+    match event {
+      ServiceEvent::Log(level, message) => self.append_log(level, &message),
+      ServiceEvent::Ready(state) => {
+        self.append_log(LogLevel::Info, "Attached to gpservice");
+        self.apply_vpn_state(state);
+      }
+      ServiceEvent::State(state) => self.apply_vpn_state(state),
+      ServiceEvent::Stopped(reason) => {
+        self.append_log(LogLevel::Warn, &format!("gpservice stopped: {reason}"));
+        self.service.replace(None);
+        if let Some(cancel) = self.auth_cancel.borrow().as_ref() {
+          cancel.cancel();
+        }
+        let was_active = self.tunnel_requested.replace(false) || self.status.get() == VpnStatus::Connected;
+        if was_active || self.status.get() == VpnStatus::Connecting {
+          self.tunnel_ended(Some(reason));
+        }
+      }
+    }
+  }
+
+  fn apply_vpn_state(self: &Rc<Self>, state: VpnState) {
+    match state {
+      VpnState::Connecting(info) => {
+        if self.tunnel_requested.get() {
+          self.gateway_name.replace(info.gateway().name().to_owned());
+          self.set_status(VpnStatus::Connecting);
+        }
+      }
+      VpnState::Connected(connected) => {
+        self.tunnel_requested.set(true);
+        self.was_connected.set(true);
+        self.reconnecting.set(false);
+        self.reconnect_failures.set(0);
+        self.last_error.replace(None);
+        self.gateway_name.replace(connected.info().gateway().name().to_owned());
+        self.append_log(
+          LogLevel::Info,
+          &format!("Connected to {}", connected.info().gateway().name()),
+        );
+        self.set_status(VpnStatus::Connected);
+      }
+      VpnState::Disconnecting => {
+        if self.tunnel_requested.get() {
+          self.set_status(VpnStatus::Disconnecting);
+        }
+      }
+      VpnState::Disconnected => {
+        if self.tunnel_requested.replace(false) {
+          self.tunnel_ended(None);
+        }
+      }
+      VpnState::Failed(message) => {
+        if self.tunnel_requested.replace(false) {
+          self.tunnel_ended(Some(message));
+        }
+      }
+      VpnState::ReconnectRequired(request) => {
+        // gpservice lost the tunnel and needs fresh credentials to resume it.
+        self.tunnel_requested.set(false);
+        self.append_log(LogLevel::Warn, "gpservice requests re-authentication");
+        if self.settings.borrow().auto_reconnect && !self.user_disconnect.get() {
+          self.restart_of.set(Some(request.attempt));
+          self.was_connected.set(false);
+          self.reconnecting.set(true);
+          self.start_connect();
+        } else {
+          self.tunnel_ended(Some("The connection needs to be re-authenticated".into()));
+        }
+      }
+    }
+  }
+
+  /// The tunnel we requested is gone (user disconnect, drop, or failure).
+  fn tunnel_ended(self: &Rc<Self>, error: Option<String>) {
+    let was_user = self.user_disconnect.replace(false);
+    let dropped = self.was_connected.replace(false);
+    if was_user {
+      self.reconnecting.set(false);
+      self.last_error.replace(None);
+      self.set_status(VpnStatus::Disconnected);
+      return;
+    }
+    let error = error.unwrap_or_else(|| "Connection ended unexpectedly".into());
+    if let Some(err) = Some(&error) {
+      self.append_log(LogLevel::Warn, err);
+    }
+    if dropped {
+      // A dropped session starts a fresh reconnect series.
+      self.reconnect_failures.set(0);
+      self.last_error.replace(Some(error.clone()));
+      if self.settings.borrow().may_reconnect(0) {
+        self.schedule_reconnect();
+        return;
+      }
+      self.toast(&error);
+      self.set_status(VpnStatus::Disconnected);
+    } else {
+      self.attempt_failed(error);
+    }
+  }
+
+  /// An attempt that never reached Connected failed.
+  fn attempt_failed(self: &Rc<Self>, error: String) {
+    self.last_error.replace(Some(error.clone()));
+    if self.reconnecting.get() {
+      let failures = self.reconnect_failures.get() + 1;
+      self.reconnect_failures.set(failures);
+      if self.settings.borrow().may_reconnect(failures) {
+        self.schedule_reconnect();
+        return;
+      }
+      self.reconnecting.set(false);
+      let msg = format!("Gave up reconnecting after {failures} attempts: {error}");
+      self.append_log(LogLevel::Error, &msg);
+      self.last_error.replace(Some(msg.clone()));
+      self.toast(&msg);
+    } else {
+      self.toast(&error);
+    }
+    self.set_status(VpnStatus::Disconnected);
+  }
+
+  fn ask_otp(&self, message: &str, reply: async_channel::Sender<Option<String>>) {
+    self.show();
+    let entry = gtk::PasswordEntry::builder()
+      .show_peek_icon(true)
+      .activates_default(true)
+      .build();
+    let dialog = adw::AlertDialog::new(Some("Verification code"), Some(message));
+    dialog.set_extra_child(Some(&entry));
+    dialog.add_responses(&[("cancel", "Cancel"), ("ok", "Continue")]);
+    dialog.set_response_appearance("ok", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("ok"));
+    dialog.set_close_response("cancel");
+    dialog.connect_response(None, move |_, response| {
+      let code = (response == "ok").then(|| entry.text().to_string());
+      let _ = reply.try_send(code);
+    });
+    dialog.present(Some(&self.w.window));
+  }
+
+  /// Turns on `fix_openssl`; returns false if it was already on.
   fn enable_fix_openssl(&self) -> bool {
     let mut s = self.settings.borrow_mut();
     if s.fix_openssl {
@@ -665,6 +879,34 @@ impl App {
       log::warn!("Cannot save settings: {err:#}");
     }
     true
+  }
+
+  /// OpenSSL reads its configuration once per process, so the legacy mode needs a restart.
+  fn offer_restart_for_openssl(&self) {
+    self.append_log(
+      LogLevel::Warn,
+      "Server needs legacy TLS renegotiation; enabled OpenSSL compatibility mode",
+    );
+    let dialog = adw::AlertDialog::new(
+      Some("Restart required"),
+      Some(
+        "The server needs legacy OpenSSL compatibility. It has been enabled and takes effect after restarting the app.",
+      ),
+    );
+    dialog.add_responses(&[("later", "Later"), ("restart", "Restart Now")]);
+    dialog.set_response_appearance("restart", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("restart"));
+    dialog.set_close_response("later");
+    let app = self.app.clone();
+    dialog.connect_response(None, move |_, response| {
+      if response == "restart" {
+        if let Ok(exe) = std::env::current_exe() {
+          let _ = std::process::Command::new(exe).spawn();
+        }
+        app.quit();
+      }
+    });
+    dialog.present(Some(&self.w.window));
   }
 
   // ---- auto reconnect ---------------------------------------------------
@@ -678,7 +920,7 @@ impl App {
       }
     }
     self.sync_auto_reconnect_action();
-    if !enabled && !self.running.get() && self.status.get() == VpnStatus::Reconnecting {
+    if !enabled && self.status.get() == VpnStatus::Reconnecting {
       self.cancel_reconnect();
       self.set_status(VpnStatus::Disconnected);
     }
@@ -721,7 +963,7 @@ impl App {
       this.reconnect_timer.replace(None);
       this.reconnecting.set(true);
       this.start_connect();
-      if !this.running.get() {
+      if this.auth_cancel.borrow().is_none() {
         // Could not even start gpclient (e.g. it was uninstalled): stop here.
         this.reconnecting.set(false);
         this.set_status(VpnStatus::Disconnected);
@@ -751,12 +993,20 @@ impl App {
       VpnStatus::Connecting if self.reconnecting.get() => {
         format!("Reconnecting to {portal} (attempt {attempt})…")
       }
-      VpnStatus::Connecting => format!("Signing in to {portal}…"),
+      VpnStatus::Connecting if self.auth_cancel.borrow().is_some() => format!("Signing in to {portal}…"),
+      VpnStatus::Connecting => format!("Connecting to {}…", self.gateway_name.borrow()),
       VpnStatus::Reconnecting => format!(
         "Retrying {portal} in {}s (attempt {attempt})",
         self.reconnect_remaining.get()
       ),
-      VpnStatus::Connected | VpnStatus::Disconnecting => portal.clone(),
+      VpnStatus::Connected | VpnStatus::Disconnecting => {
+        let gateway = self.gateway_name.borrow();
+        if gateway.is_empty() {
+          portal.clone()
+        } else {
+          format!("{portal} · {gateway}")
+        }
+      }
     };
     w.status_icon.set_icon_name(Some(status.icon_name(failed)));
     w.status_title.set_label(status.label());
@@ -768,7 +1018,7 @@ impl App {
       w.status_detail.remove_css_class("error");
     }
 
-    let active = self.running.get() || status == VpnStatus::Reconnecting;
+    let active = self.is_active() || status == VpnStatus::Connecting;
     w.form.set_sensitive(!active);
     w.remember.set_sensitive(!active);
     w.action.set_sensitive(status != VpnStatus::Disconnecting);
@@ -915,14 +1165,14 @@ impl App {
   }
 
   fn request_quit(self: &Rc<Self>) {
-    if !self.running.get() {
+    if !self.is_active() {
       self.app.quit();
       return;
     }
     self.show();
     let dialog = adw::AlertDialog::new(
       Some("Disconnect and quit?"),
-      Some("The VPN is still running. It will be disconnected before the application quits."),
+      Some("The VPN is still running. Quitting stops gpservice, which disconnects the VPN."),
     );
     dialog.add_responses(&[("cancel", "Cancel"), ("quit", "Disconnect & Quit")]);
     dialog.set_response_appearance("quit", adw::ResponseAppearance::Destructive);
@@ -932,12 +1182,26 @@ impl App {
     dialog.connect_response(None, move |_, response| {
       let Some(this) = weak.upgrade() else { return };
       if response == "quit" {
-        this.quit_after_disconnect.set(true);
-        this.disconnect();
+        if let Some(cancel) = this.auth_cancel.borrow().as_ref() {
+          cancel.cancel();
+        }
+        // Dropping the service handle closes gpservice's stdin: it disconnects and exits.
+        this.service.replace(None);
+        this.app.quit();
       }
     });
     dialog.present(Some(&self.w.window));
   }
+}
+
+fn ui_log(events: &async_channel::Sender<AttemptEvent>, message: String) {
+  let _ = events.try_send(AttemptEvent::Log(LogLevel::Info, message));
+}
+
+/// OpenSSL "unsafe legacy renegotiation disabled" (servers needing `--fix-openssl`).
+fn is_legacy_tls_error(error: &str) -> bool {
+  let e = error.to_ascii_lowercase();
+  e.contains("legacy renegotiation") || e.contains("legacy_renegotiation")
 }
 
 /// Makes the bundled icons available to GTK by name.
@@ -1098,5 +1362,18 @@ fn build_widgets(app: &adw::Application, settings: &Settings) -> Widgets {
     password,
     remember,
     action,
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::is_legacy_tls_error;
+
+  #[test]
+  fn detects_openssl_legacy_renegotiation_errors() {
+    assert!(is_legacy_tls_error(
+      "error:0A000152:SSL routines:final_renegotiate:unsafe legacy renegotiation disabled"
+    ));
+    assert!(!is_legacy_tls_error("certificate verify failed"));
   }
 }

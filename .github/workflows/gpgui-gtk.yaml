@@ -62,7 +62,7 @@ jobs:
         run: cargo test --locked -p gpgui-gtk
 
       - name: Build release binaries
-        run: cargo build --release --locked -p gpclient -p gpauth -p gpgui-gtk
+        run: cargo build --release --locked -p gpservice -p gpclient -p gpauth -p gpgui-gtk
 
       - name: Package
         id: pkg
@@ -75,8 +75,11 @@ jobs:
           name="gpgui-gtk-${version}-linux-${{ matrix.arch }}"
           dest="dist/$name"
           # Mirror the repo layout so the bundled install.sh works unchanged.
-          mkdir -p "$dest/target/release" "$dest/apps/gpgui-gtk" "$dest/packaging/files/usr/libexec/gpclient"
-          install -m755 target/release/gpclient target/release/gpauth target/release/gpgui-gtk "$dest/target/release/"
+          mkdir -p "$dest/target/release" "$dest/apps/gpgui-gtk" "$dest/packaging/files/usr/libexec/gpclient" \
+            "$dest/packaging/files/usr/share/polkit-1/actions"
+          install -m755 target/release/gpservice target/release/gpclient target/release/gpauth target/release/gpgui-gtk \
+            target/release/gp-vpnc-script-installer target/release/gp-hip-script-installer "$dest/target/release/"
+          install -m644 packaging/files/usr/share/polkit-1/actions/com.yuezk.gpgui.policy "$dest/packaging/files/usr/share/polkit-1/actions/"
           cp -r apps/gpgui-gtk/data apps/gpgui-gtk/install.sh apps/gpgui-gtk/README.md "$dest/apps/gpgui-gtk/"
           install -m755 packaging/files/usr/libexec/gpclient/vpnc-script "$dest/packaging/files/usr/libexec/gpclient/"
           cp LICENSE "$dest/"
@@ -118,7 +121,7 @@ jobs:
             dist/*.sha256
           generate_release_notes: true
           body: |
-            Open-source GTK4/libadwaita GUI for GlobalProtect-openconnect, bundled with `gpclient` and `gpauth`.
+            Open-source GTK4/libadwaita GUI for GlobalProtect-openconnect, bundled with `gpservice`, `gpclient` and `gpauth`. Like the official GUI, it talks to the root `gpservice`, so connecting needs no admin password.
 
             **Install** (Debian/Ubuntu, x86_64 or aarch64):
             ```sh

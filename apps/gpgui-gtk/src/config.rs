@@ -64,10 +64,10 @@ pub struct Settings {
   pub client_version: String,
   pub mtu: u32,
   pub reconnect_timeout: u32,
-  pub extra_args: String,
 
   // Application behaviour.
-  pub gpclient_path: String,
+  /// Absolute path of gpservice; empty = auto-detect.
+  pub gpservice_path: String,
   pub close_to_tray: bool,
   /// Reconnect automatically when an established connection drops.
   pub auto_reconnect: bool,
@@ -95,8 +95,7 @@ impl Default for Settings {
       client_version: String::new(),
       mtu: 0,
       reconnect_timeout: 300,
-      extra_args: String::new(),
-      gpclient_path: String::new(),
+      gpservice_path: String::new(),
       close_to_tray: true,
       auto_reconnect: true,
       reconnect_delay: 5,

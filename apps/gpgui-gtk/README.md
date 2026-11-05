@@ -2,8 +2,11 @@
 
 Open-source GTK4 / libadwaita GUI for GlobalProtect-openconnect, replacing the proprietary `gpgui`.
 
-It drives the upstream `gpclient` CLI through `pkexec`, so all auth methods supported by
-`gpclient` (password, SAML/SSO via `gpauth`, certificates, HIP) work unchanged.
+Same architecture as the official GUI: sign-in (password, SAML/SSO via `gpauth`, MFA)
+runs in the user session, then the GUI asks the root `gpservice` to open the tunnel over
+its authenticated Noise/WebSocket channel. `gpservice` is started with
+`pkexec gpservice --desktop-credentials`; the upstream polkit policy lets active local
+users do that without a password. Internal (non-tunnel) gateways are not supported yet.
 
 ## Features
 
@@ -23,21 +26,19 @@ renders the window to a PNG and exits.
 
 ```sh
 sudo apt install build-essential pkg-config libgtk-4-dev libadwaita-1-dev
-cargo build --release -p gpgui-gtk
+cargo build --release -p gpservice -p gpclient -p gpauth -p gpgui-gtk
 ```
 
 ## Install
 
 ```sh
-sudo install -Dm755 target/release/gpgui-gtk /usr/bin/gpgui-gtk
-sudo install -Dm644 apps/gpgui-gtk/data/io.github.gpgui_gtk.GpguiGtk.desktop /usr/share/applications/
-sudo install -Dm644 apps/gpgui-gtk/data/io.github.gpgui_gtk.gpclient.policy /usr/share/polkit-1/actions/
+sudo sh apps/gpgui-gtk/install.sh
 ```
 
-`gpclient` and `gpauth` must be installed (`/usr/bin/gpclient`, or set the path in Preferences;
-the polkit policy assumes `/usr/bin/gpclient`).
+`install.sh` installs `gpservice`, `gpclient`, `gpauth`, the helpers in
+`/usr/libexec/gpclient/` and the upstream polkit policy (`com.yuezk.gpgui.policy`).
 
 ## Notes
 
 - GNOME needs the AppIndicator extension to show the tray icon.
-- Quitting while connected disconnects first, because `gpclient` logs to the GUI's pipes.
+- Quitting the app stops gpservice and therefore the VPN (close to tray to keep it running).

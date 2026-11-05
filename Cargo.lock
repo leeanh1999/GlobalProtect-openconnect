@@ -2518,6 +2518,8 @@ dependencies = [
  "async-channel",
  "directories",
  "env_logger",
+ "futures-util",
+ "gpapi",
  "gtk4",
  "ksni",
  "libadwaita",
@@ -2526,6 +2528,10 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-tungstenite 0.30.0",
+ "tokio-util",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]

@@ -53,7 +53,7 @@ pub fn present(parent: &impl IsA<gtk::Widget>, s: Settings, on_close: impl Fn(Se
   let connection = adw::PreferencesGroup::builder().title("Connection").build();
   let fix_openssl = switch(
     "Legacy OpenSSL compatibility",
-    "For servers that need legacy TLS renegotiation (gpclient --fix-openssl)",
+    "For servers that need legacy TLS renegotiation; applies after restarting the app",
     s.fix_openssl,
   );
   for row in [&as_gateway, &auto_gateway, &browser, &hip, &ignore_tls, &fix_openssl] {
@@ -98,11 +98,9 @@ pub fn present(parent: &impl IsA<gtk::Widget>, s: Settings, on_close: impl Fn(Se
   identity.add(&client_version);
 
   // Advanced
-  let gpclient_path = entry("gpclient path (empty = auto-detect)", &s.gpclient_path);
-  let extra_args = entry("Extra gpclient connect arguments", &s.extra_args);
+  let gpservice_path = entry("gpservice path (empty = auto-detect)", &s.gpservice_path);
   let advanced = adw::PreferencesGroup::builder().title("Advanced").build();
-  advanced.add(&gpclient_path);
-  advanced.add(&extra_args);
+  advanced.add(&gpservice_path);
 
   // Auto reconnect (handled by the GUI after gpclient exits)
   let auto_reconnect = switch(
@@ -182,8 +180,7 @@ pub fn present(parent: &impl IsA<gtk::Widget>, s: Settings, on_close: impl Fn(Se
       reconnect_timeout: reconnect.value() as u32,
       os: ClientOs::from_index(os.selected()),
       client_version: client_version.text().trim().to_owned(),
-      gpclient_path: gpclient_path.text().trim().to_owned(),
-      extra_args: extra_args.text().trim().to_owned(),
+      gpservice_path: gpservice_path.text().trim().to_owned(),
       close_to_tray: close_to_tray.is_active(),
       auto_reconnect: auto_reconnect.is_active(),
       reconnect_delay: reconnect_delay.value() as u32,
