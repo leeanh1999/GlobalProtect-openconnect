@@ -68,7 +68,13 @@ pub fn present(parent: &impl IsA<gtk::Widget>, s: Settings, on_close: impl Fn(Se
     s.disable_ipv6,
   );
   let mtu = spin("MTU", "0 = server default (legacy servers only)", 0.0, 9000.0, s.mtu);
-  let reconnect = spin("Reconnect timeout", "Seconds", 0.0, 86400.0, s.reconnect_timeout);
+  let reconnect = spin(
+    "Tunnel retry timeout",
+    "Seconds gpclient keeps retrying a dropped tunnel before giving up",
+    0.0,
+    86400.0,
+    s.reconnect_timeout,
+  );
   let tunnel = adw::PreferencesGroup::builder().title("Tunnel").build();
   for row in [
     no_dtls.upcast_ref::<gtk::Widget>(),
@@ -98,6 +104,39 @@ pub fn present(parent: &impl IsA<gtk::Widget>, s: Settings, on_close: impl Fn(Se
   advanced.add(&gpclient_path);
   advanced.add(&extra_args);
 
+  // Auto reconnect (handled by the GUI after gpclient exits)
+  let auto_reconnect = switch(
+    "Reconnect automatically",
+    "Start a new connection when an established one drops",
+    s.auto_reconnect,
+  );
+  let reconnect_delay = spin(
+    "First retry after",
+    "Seconds; doubles after each failed attempt, up to 5 minutes",
+    1.0,
+    300.0,
+    s.reconnect_delay,
+  );
+  let reconnect_max = spin(
+    "Maximum attempts",
+    "Give up after this many failures in a row (0 = keep trying)",
+    0.0,
+    1000.0,
+    s.reconnect_max_attempts,
+  );
+  auto_reconnect
+    .bind_property("active", &reconnect_delay, "sensitive")
+    .sync_create()
+    .build();
+  auto_reconnect
+    .bind_property("active", &reconnect_max, "sensitive")
+    .sync_create()
+    .build();
+  let reconnect_group = adw::PreferencesGroup::builder().title("Auto reconnect").build();
+  reconnect_group.add(&auto_reconnect);
+  reconnect_group.add(&reconnect_delay);
+  reconnect_group.add(&reconnect_max);
+
   // Application
   let close_to_tray = switch(
     "Close to tray",
@@ -114,6 +153,7 @@ pub fn present(parent: &impl IsA<gtk::Widget>, s: Settings, on_close: impl Fn(Se
     .icon_name("network-vpn-symbolic")
     .build();
   page_vpn.add(&connection);
+  page_vpn.add(&reconnect_group);
   page_vpn.add(&tunnel);
   page_vpn.add(&identity);
 
@@ -145,6 +185,9 @@ pub fn present(parent: &impl IsA<gtk::Widget>, s: Settings, on_close: impl Fn(Se
       gpclient_path: gpclient_path.text().trim().to_owned(),
       extra_args: extra_args.text().trim().to_owned(),
       close_to_tray: close_to_tray.is_active(),
+      auto_reconnect: auto_reconnect.is_active(),
+      reconnect_delay: reconnect_delay.value() as u32,
+      reconnect_max_attempts: reconnect_max.value() as u32,
       start_minimized: start_minimized.is_active(),
       ..s.clone()
     });

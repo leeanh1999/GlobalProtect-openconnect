@@ -69,6 +69,12 @@ pub struct Settings {
   // Application behaviour.
   pub gpclient_path: String,
   pub close_to_tray: bool,
+  /// Reconnect automatically when an established connection drops.
+  pub auto_reconnect: bool,
+  /// First retry delay in seconds; later retries back off exponentially.
+  pub reconnect_delay: u32,
+  /// Give up after this many failed attempts in a row (0 = never give up).
+  pub reconnect_max_attempts: u32,
   pub start_minimized: bool,
 }
 
@@ -92,12 +98,16 @@ impl Default for Settings {
       extra_args: String::new(),
       gpclient_path: String::new(),
       close_to_tray: true,
+      auto_reconnect: true,
+      reconnect_delay: 5,
+      reconnect_max_attempts: 0,
       start_minimized: false,
     }
   }
 }
 
 const MAX_RECENT: usize = 10;
+const MAX_RECONNECT_DELAY: u32 = 300;
 
 impl Settings {
   fn path() -> anyhow::Result<PathBuf> {
@@ -131,6 +141,18 @@ impl Settings {
     Ok(())
   }
 
+  /// Delay before reconnect attempt `attempt` (1-based): base, 2×, 4×, … capped at 5 min.
+  pub fn reconnect_backoff(&self, attempt: u32) -> u32 {
+    let base = self.reconnect_delay.max(1);
+    let factor = 1u32 << attempt.saturating_sub(1).min(8);
+    base.saturating_mul(factor).min(MAX_RECONNECT_DELAY)
+  }
+
+  /// Whether another reconnect attempt is allowed after `failed` attempts in a row.
+  pub fn may_reconnect(&self, failed: u32) -> bool {
+    self.auto_reconnect && (self.reconnect_max_attempts == 0 || failed < self.reconnect_max_attempts)
+  }
+
   pub fn remember_portal(&mut self, portal: &str) {
     let portal = portal.trim();
     if portal.is_empty() {
@@ -156,6 +178,32 @@ mod tests {
     assert_eq!(settings.recent_portals.len(), MAX_RECENT);
     assert_eq!(settings.recent_portals[0], "p3");
     assert_eq!(settings.recent_portals.iter().filter(|p| *p == "p3").count(), 1);
+  }
+
+  #[test]
+  fn reconnect_backoff_doubles_and_caps() {
+    let s = Settings {
+      reconnect_delay: 5,
+      ..Default::default()
+    };
+    let delays: Vec<u32> = (1..=9).map(|a| s.reconnect_backoff(a)).collect();
+    assert_eq!(delays, [5, 10, 20, 40, 80, 160, 300, 300, 300]);
+    let zero = Settings {
+      reconnect_delay: 0,
+      ..Default::default()
+    };
+    assert_eq!(zero.reconnect_backoff(1), 1);
+  }
+
+  #[test]
+  fn reconnect_attempt_limit() {
+    let mut s = Settings::default();
+    assert!(s.may_reconnect(1000), "0 means unlimited");
+    s.reconnect_max_attempts = 3;
+    assert!(s.may_reconnect(2));
+    assert!(!s.may_reconnect(3));
+    s.auto_reconnect = false;
+    assert!(!s.may_reconnect(0));
   }
 
   #[test]

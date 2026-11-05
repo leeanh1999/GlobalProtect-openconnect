@@ -4,6 +4,8 @@ pub enum VpnStatus {
   Connecting,
   Connected,
   Disconnecting,
+  /// Waiting to reconnect after the connection dropped.
+  Reconnecting,
 }
 
 impl VpnStatus {
@@ -13,6 +15,7 @@ impl VpnStatus {
       VpnStatus::Connecting => "Connecting…",
       VpnStatus::Connected => "Connected",
       VpnStatus::Disconnecting => "Disconnecting…",
+      VpnStatus::Reconnecting => "Reconnecting…",
     }
   }
 
@@ -20,14 +23,17 @@ impl VpnStatus {
   pub fn icon_name(self, failed: bool) -> &'static str {
     match self {
       VpnStatus::Connected => "gpgui-gtk-connected",
-      VpnStatus::Connecting | VpnStatus::Disconnecting => "gpgui-gtk-connecting",
+      VpnStatus::Connecting | VpnStatus::Disconnecting | VpnStatus::Reconnecting => "gpgui-gtk-connecting",
       VpnStatus::Disconnected if failed => "gpgui-gtk-error",
       VpnStatus::Disconnected => "gpgui-gtk-disconnected",
     }
   }
 
   pub fn is_busy(self) -> bool {
-    matches!(self, VpnStatus::Connecting | VpnStatus::Disconnecting)
+    matches!(
+      self,
+      VpnStatus::Connecting | VpnStatus::Disconnecting | VpnStatus::Reconnecting
+    )
   }
 
   pub fn is_connected(self) -> bool {

@@ -10,7 +10,14 @@ It drives the upstream `gpclient` CLI through `pkexec`, so all auth methods supp
 - Connect / disconnect a portal (or gateway), recent portals, optional gateway selection
 - Password saved in the system keyring (Secret Service)
 - System tray icon (StatusNotifierItem) with connect/disconnect, close-to-tray, start minimized
-- Preferences mapping to `gpclient connect` options; live log view
+- Single-page window; connection log available from the menu (Show Log, Ctrl+L)
+- Auto reconnect when an established connection drops (exponential back-off,
+  optional attempt limit; toggle in the menu or Preferences)
+- Detects leftover gpclient/gpauth/openconnect processes and offers to stop them
+- Preferences mapping to `gpclient connect` options
+
+Dev aid: `GPGUI_GTK_SCREENSHOT=out.png GPGUI_GTK_DEMO=error|reconnecting|log gpgui-gtk`
+renders the window to a PNG and exits.
 
 ## Build
 

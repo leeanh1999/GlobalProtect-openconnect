@@ -19,7 +19,9 @@ const MAX_LOG_LINES: i32 = 2000;
 struct Widgets {
   window: adw::ApplicationWindow,
   toasts: adw::ToastOverlay,
-  status: adw::StatusPage,
+  status_icon: gtk::Image,
+  status_title: gtk::Label,
+  status_detail: gtk::Label,
   form: adw::PreferencesGroup,
   portal: adw::EntryRow,
   recent_list: gtk::ListBox,
@@ -27,9 +29,8 @@ struct Widgets {
   gateway: adw::EntryRow,
   username: adw::EntryRow,
   password: adw::PasswordEntryRow,
-  remember: adw::SwitchRow,
+  remember: gtk::CheckButton,
   action: gtk::Button,
-  log_view: gtk::TextView,
 }
 
 pub struct App {
@@ -48,6 +49,17 @@ pub struct App {
   /// pid of our own gpclient, never offered for killing.
   child_pid: Cell<Option<u32>>,
   last_error: RefCell<Option<String>>,
+  /// Connection log, shown on demand from the menu.
+  log: gtk::TextBuffer,
+  log_view: RefCell<Option<glib::WeakRef<gtk::TextView>>>,
+  /// The current gpclient run reached "Connected".
+  was_connected: Cell<bool>,
+  /// The current gpclient run is an automatic reconnect.
+  reconnecting: Cell<bool>,
+  /// Failed reconnect attempts in a row.
+  reconnect_failures: Cell<u32>,
+  reconnect_remaining: Cell<u32>,
+  reconnect_timer: RefCell<Option<glib::SourceId>>,
   tray: TrayHandle,
   vpn_tx: async_channel::Sender<VpnEvent>,
   _hold: RefCell<Option<gio::ApplicationHoldGuard>>,
@@ -65,6 +77,7 @@ pub fn setup(app: &adw::Application) {
     if !(settings.start_minimized && created.tray.is_available()) {
       created.show();
     }
+    created.maybe_screenshot();
     instance.replace(Some(created));
   });
 }
@@ -72,8 +85,7 @@ pub fn setup(app: &adw::Application) {
 impl App {
   fn new(app: &adw::Application) -> Rc<Self> {
     let settings = Settings::load();
-    let icon_root = icons::install();
-    load_style(icon_root.as_deref());
+    load_icons(icons::install().as_deref());
     let w = build_widgets(app, &settings);
 
     let (vpn_tx, vpn_rx) = async_channel::unbounded::<VpnEvent>();
@@ -92,6 +104,13 @@ impl App {
       another_instance: Cell::new(false),
       child_pid: Cell::new(None),
       last_error: RefCell::default(),
+      log: gtk::TextBuffer::new(None),
+      log_view: RefCell::default(),
+      was_connected: Cell::new(false),
+      reconnecting: Cell::new(false),
+      reconnect_failures: Cell::new(0),
+      reconnect_remaining: Cell::new(0),
+      reconnect_timer: RefCell::default(),
       tray,
       vpn_tx,
       _hold: RefCell::new(Some(app.hold())),
@@ -130,6 +149,52 @@ impl App {
     this
   }
 
+  /// Dev aid: `GPGUI_GTK_SCREENSHOT=out.png [GPGUI_GTK_DEMO=state]` renders the
+  /// window to a PNG and quits. Lets layout changes be checked headlessly.
+  fn maybe_screenshot(self: &Rc<Self>) {
+    let Some(path) = std::env::var_os("GPGUI_GTK_SCREENSHOT") else {
+      return;
+    };
+    match std::env::var("GPGUI_GTK_DEMO").as_deref() {
+      Ok("reconnecting") => {
+        self.reconnect_failures.set(2);
+        self.reconnect_remaining.set(17);
+        self.set_status(VpnStatus::Reconnecting);
+      }
+      Ok("error") => {
+        self.last_error.replace(Some(
+          "Re-run it with the `--fix-openssl` option to work around this issue".into(),
+        ));
+        self.set_status(VpnStatus::Disconnected);
+      }
+      Ok("connected") => self.set_status(VpnStatus::Connected),
+      Ok("log") => {
+        self.append_log(LogLevel::Info, "──── Connecting to vpn.example.com ────");
+        self.append_log(LogLevel::Info, "Portal prelogin succeeded");
+        self.append_log(LogLevel::Warn, "Connection lost — reconnect attempt 1 in 5s");
+        self.append_log(LogLevel::Error, "Re-run it with the `--fix-openssl` option");
+        self.show_log();
+      }
+      _ => {}
+    }
+    let this = self.clone();
+    glib::timeout_add_local_once(std::time::Duration::from_millis(1200), move || {
+      let window = &this.w.window;
+      let paintable = gtk::WidgetPaintable::new(Some(window));
+      let snapshot = gtk::Snapshot::new();
+      paintable.snapshot(&snapshot, window.width() as f64, window.height() as f64);
+      let texture = snapshot
+        .to_node()
+        .zip(window.native().and_then(|n| n.renderer()))
+        .map(|(node, renderer)| renderer.render_texture(&node, None));
+      match texture.map(|t| t.save_to_png(&path)) {
+        Some(Ok(())) => log::info!("Screenshot saved ({}x{})", window.width(), window.height()),
+        other => log::error!("Screenshot failed: {other:?}"),
+      }
+      this.app.quit();
+    });
+  }
+
   fn show(&self) {
     self.w.window.present();
   }
@@ -162,6 +227,26 @@ impl App {
       .build();
 
     let weak = Rc::downgrade(self);
+    let show_log = gio::ActionEntry::builder("show-log")
+      .activate(move |_: &adw::Application, _, _| {
+        if let Some(this) = weak.upgrade() {
+          this.show_log();
+        }
+      })
+      .build();
+
+    let weak = Rc::downgrade(self);
+    let auto_reconnect = gio::ActionEntry::builder("auto-reconnect")
+      .state(self.settings.borrow().auto_reconnect.to_variant())
+      .activate(move |_: &adw::Application, action, _| {
+        let enabled = !action.state().and_then(|v| v.get::<bool>()).unwrap_or(false);
+        if let Some(this) = weak.upgrade() {
+          this.set_auto_reconnect(enabled);
+        }
+      })
+      .build();
+
+    let weak = Rc::downgrade(self);
     let about = gio::ActionEntry::builder("about")
       .activate(move |_: &adw::Application, _, _| {
         if let Some(this) = weak.upgrade() {
@@ -179,7 +264,10 @@ impl App {
       })
       .build();
 
-    self.app.add_action_entries([prefs, stop_others, about, quit]);
+    self
+      .app
+      .add_action_entries([prefs, show_log, auto_reconnect, stop_others, about, quit]);
+    self.app.set_accels_for_action("app.show-log", &["<Control>l"]);
     self.app.set_accels_for_action("app.quit", &["<Control>q"]);
     self.app.set_accels_for_action("app.preferences", &["<Control>comma"]);
   }
@@ -188,7 +276,7 @@ impl App {
     let weak = Rc::downgrade(self);
     self.w.action.connect_clicked(move |_| {
       if let Some(this) = weak.upgrade() {
-        if this.running.get() {
+        if this.running.get() || this.status.get() == VpnStatus::Reconnecting {
           this.disconnect();
         } else {
           this.connect();
@@ -317,6 +405,8 @@ impl App {
     if self.running.get() {
       return;
     }
+    self.cancel_reconnect();
+    self.reconnect_failures.set(0);
     let others = vpn::find_vpn_processes(&[]);
     if others.is_empty() {
       self.start_connect();
@@ -352,8 +442,16 @@ impl App {
       password: Some(self.w.password.text().to_string()).filter(|p| !p.is_empty()),
     };
 
-    self.clear_log();
-    self.last_error.replace(None);
+    let verb = if self.reconnecting.get() {
+      "Reconnecting to"
+    } else {
+      "Connecting to"
+    };
+    self.append_log(LogLevel::Info, &format!("──── {verb} {} ────", request.portal));
+    self.was_connected.set(false);
+    if !self.reconnecting.get() {
+      self.last_error.replace(None);
+    }
     self.user_disconnect.set(false);
     self.needs_fix_openssl.set(false);
     self.another_instance.set(false);
@@ -369,6 +467,15 @@ impl App {
   }
 
   fn disconnect(self: &Rc<Self>) {
+    if !self.running.get() && self.status.get() == VpnStatus::Reconnecting {
+      self.cancel_reconnect();
+      self.last_error.replace(None);
+      self.set_status(VpnStatus::Disconnected);
+      if self.quit_after_disconnect.get() {
+        self.app.quit();
+      }
+      return;
+    }
     if !self.running.get() || self.status.get() == VpnStatus::Disconnecting {
       return;
     }
@@ -483,6 +590,10 @@ impl App {
         self.append_log(level, &message);
       }
       VpnEvent::Connected => {
+        self.was_connected.set(true);
+        self.reconnecting.set(false);
+        self.reconnect_failures.set(0);
+        self.last_error.replace(None);
         if self.status.get() != VpnStatus::Disconnecting {
           self.set_status(VpnStatus::Connected);
         }
@@ -503,6 +614,28 @@ impl App {
           let others = vpn::find_vpn_processes(&[]);
           if !others.is_empty() {
             self.confirm_stop_others(others, true);
+            return;
+          }
+        }
+        let dropped = self.was_connected.replace(false);
+        if !was_user && !self.quit_after_disconnect.get() && (dropped || self.reconnecting.get()) {
+          // A dropped session starts a fresh series; a failed retry counts against the limit.
+          let failures = if dropped { 0 } else { self.reconnect_failures.get() + 1 };
+          self.reconnect_failures.set(failures);
+          if let (false, Some(err)) = (success, &error) {
+            self.last_error.replace(Some(err.clone()));
+          }
+          if self.settings.borrow().may_reconnect(failures) {
+            self.schedule_reconnect();
+            return;
+          }
+          self.reconnecting.set(false);
+          if failures > 0 {
+            let msg = format!("Gave up reconnecting after {failures} attempts");
+            self.append_log(LogLevel::Error, &msg);
+            self.last_error.replace(Some(msg.clone()));
+            self.toast(&msg);
+            self.set_status(VpnStatus::Disconnected);
             return;
           }
         }
@@ -534,31 +667,115 @@ impl App {
     true
   }
 
+  // ---- auto reconnect ---------------------------------------------------
+
+  fn set_auto_reconnect(&self, enabled: bool) {
+    {
+      let mut s = self.settings.borrow_mut();
+      s.auto_reconnect = enabled;
+      if let Err(err) = s.save() {
+        log::warn!("Cannot save settings: {err:#}");
+      }
+    }
+    self.sync_auto_reconnect_action();
+    if !enabled && !self.running.get() && self.status.get() == VpnStatus::Reconnecting {
+      self.cancel_reconnect();
+      self.set_status(VpnStatus::Disconnected);
+    }
+  }
+
+  fn sync_auto_reconnect_action(&self) {
+    let enabled = self.settings.borrow().auto_reconnect;
+    if let Some(action) = self
+      .app
+      .lookup_action("auto-reconnect")
+      .and_downcast::<gio::SimpleAction>()
+    {
+      action.set_state(&enabled.to_variant());
+    }
+  }
+
+  /// Waits the back-off delay (with a visible countdown), then reconnects.
+  fn schedule_reconnect(self: &Rc<Self>) {
+    self.cancel_reconnect();
+    let attempt = self.reconnect_failures.get() + 1;
+    let delay = self.settings.borrow().reconnect_backoff(attempt);
+    self.append_log(
+      LogLevel::Warn,
+      &format!("Connection lost — reconnect attempt {attempt} in {delay}s"),
+    );
+    self.reconnect_remaining.set(delay);
+    self.set_status(VpnStatus::Reconnecting);
+
+    let weak = Rc::downgrade(self);
+    let id = glib::timeout_add_seconds_local(1, move || {
+      let Some(this) = weak.upgrade() else {
+        return glib::ControlFlow::Break;
+      };
+      let left = this.reconnect_remaining.get().saturating_sub(1);
+      this.reconnect_remaining.set(left);
+      if left > 0 {
+        this.set_status(VpnStatus::Reconnecting);
+        return glib::ControlFlow::Continue;
+      }
+      this.reconnect_timer.replace(None);
+      this.reconnecting.set(true);
+      this.start_connect();
+      if !this.running.get() {
+        // Could not even start gpclient (e.g. it was uninstalled): stop here.
+        this.reconnecting.set(false);
+        this.set_status(VpnStatus::Disconnected);
+      }
+      glib::ControlFlow::Break
+    });
+    self.reconnect_timer.replace(Some(id));
+  }
+
+  fn cancel_reconnect(&self) {
+    if let Some(id) = self.reconnect_timer.take() {
+      id.remove();
+    }
+    self.reconnecting.set(false);
+  }
+
   fn set_status(&self, status: VpnStatus) {
     self.status.set(status);
     let w = &self.w;
     let portal = self.settings.borrow().profile.portal.clone();
+    let error = self.last_error.borrow().clone();
+    let failed = error.is_some();
+    let attempt = self.reconnect_failures.get() + 1;
 
-    let failed = self.last_error.borrow().is_some();
-    w.status.set_icon_name(Some(status.icon_name(failed)));
-    w.status.set_title(status.label());
-    let description = match (status, self.last_error.borrow().as_deref()) {
-      (VpnStatus::Disconnected, Some(err)) => glib::markup_escape_text(err).to_string(),
-      (VpnStatus::Disconnected, None) => "Not connected".to_owned(),
-      (VpnStatus::Connecting, _) => {
-        format!("Signing in to <b>{}</b>…", glib::markup_escape_text(&portal))
+    let detail = match status {
+      VpnStatus::Disconnected => error.clone().unwrap_or_else(|| "Not connected".to_owned()),
+      VpnStatus::Connecting if self.reconnecting.get() => {
+        format!("Reconnecting to {portal} (attempt {attempt})…")
       }
-      _ => format!("<b>{}</b>", glib::markup_escape_text(&portal)),
+      VpnStatus::Connecting => format!("Signing in to {portal}…"),
+      VpnStatus::Reconnecting => format!(
+        "Retrying {portal} in {}s (attempt {attempt})",
+        self.reconnect_remaining.get()
+      ),
+      VpnStatus::Connected | VpnStatus::Disconnecting => portal.clone(),
     };
-    w.status.set_description(Some(&description));
+    w.status_icon.set_icon_name(Some(status.icon_name(failed)));
+    w.status_title.set_label(status.label());
+    w.status_detail.set_label(&detail);
+    w.status_detail.set_tooltip_text(Some(&detail));
+    if failed && status == VpnStatus::Disconnected {
+      w.status_detail.add_css_class("error");
+    } else {
+      w.status_detail.remove_css_class("error");
+    }
 
-    w.form.set_sensitive(!self.running.get());
+    let active = self.running.get() || status == VpnStatus::Reconnecting;
+    w.form.set_sensitive(!active);
+    w.remember.set_sensitive(!active);
     w.action.set_sensitive(status != VpnStatus::Disconnecting);
-    let (label, add, remove) = if self.running.get() {
-      let label = if status == VpnStatus::Connecting {
-        "Cancel"
-      } else {
-        "Disconnect"
+    let (label, add, remove) = if active {
+      let label = match status {
+        VpnStatus::Connecting | VpnStatus::Reconnecting => "Cancel",
+        _ => "Disconnect",
       };
       (label, "destructive-action", "suggested-action")
     } else {
@@ -574,12 +791,8 @@ impl App {
 
   // ---- log ----------------------------------------------------------------
 
-  fn clear_log(&self) {
-    self.w.log_view.buffer().set_text("");
-  }
-
   fn append_log(&self, level: LogLevel, message: &str) {
-    let buffer = self.w.log_view.buffer();
+    let buffer = &self.log;
     let prefix = match level {
       LogLevel::Error => "ERROR ",
       LogLevel::Warn => "WARN  ",
@@ -596,8 +809,72 @@ impl App {
         buffer.delete(&mut start, &mut cut);
       }
     }
-    buffer.place_cursor(&buffer.end_iter());
-    self.w.log_view.scroll_mark_onscreen(&buffer.get_insert());
+    self.scroll_log_to_end();
+  }
+
+  fn scroll_log_to_end(&self) {
+    let view = self.log_view.borrow().as_ref().and_then(|weak| weak.upgrade());
+    if let Some(view) = view {
+      let mut end = self.log.end_iter();
+      view.scroll_to_iter(&mut end, 0.0, false, 0.0, 1.0);
+    }
+  }
+
+  fn show_log(self: &Rc<Self>) {
+    let view = gtk::TextView::builder()
+      .buffer(&self.log)
+      .editable(false)
+      .cursor_visible(false)
+      .monospace(true)
+      .wrap_mode(gtk::WrapMode::WordChar)
+      .top_margin(8)
+      .bottom_margin(8)
+      .left_margin(10)
+      .right_margin(10)
+      .build();
+    let scroller = gtk::ScrolledWindow::builder().child(&view).vexpand(true).build();
+
+    let copy = gtk::Button::builder()
+      .icon_name("edit-copy-symbolic")
+      .tooltip_text("Copy log")
+      .build();
+    let buffer = self.log.clone();
+    let toasts = adw::ToastOverlay::new();
+    let toasts_ref = toasts.clone();
+    copy.connect_clicked(move |button| {
+      let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
+      button.clipboard().set_text(&text);
+      toasts_ref.add_toast(adw::Toast::new("Log copied"));
+    });
+    let clear = gtk::Button::builder()
+      .icon_name("user-trash-symbolic")
+      .tooltip_text("Clear log")
+      .build();
+    let buffer = self.log.clone();
+    clear.connect_clicked(move |_| buffer.set_text(""));
+
+    let header = adw::HeaderBar::new();
+    header.pack_start(&copy);
+    header.pack_start(&clear);
+    toasts.set_child(Some(&scroller));
+    let content = adw::ToolbarView::new();
+    content.add_top_bar(&header);
+    content.set_content(Some(&toasts));
+
+    let dialog = adw::Dialog::builder()
+      .title("Connection Log")
+      .content_width(680)
+      .content_height(460)
+      .child(&content)
+      .build();
+    self.log_view.replace(Some(view.downgrade()));
+    dialog.present(Some(&self.w.window));
+    let weak = Rc::downgrade(self);
+    glib::idle_add_local_once(move || {
+      if let Some(this) = weak.upgrade() {
+        this.scroll_log_to_end();
+      }
+    });
   }
 
   // ---- dialogs & quit -----------------------------------------------------
@@ -619,6 +896,9 @@ impl App {
       if let Err(err) = s.save() {
         log::warn!("Cannot save settings: {err:#}");
       }
+      let enabled = s.auto_reconnect;
+      drop(s);
+      this.set_auto_reconnect(enabled);
     });
   }
 
@@ -660,26 +940,54 @@ impl App {
   }
 }
 
-/// Registers bundled icons and app CSS for the default display.
-fn load_style(icon_root: Option<&std::path::Path>) {
-  let Some(display) = gtk::gdk::Display::default() else {
-    return;
-  };
-  if let Some(root) = icon_root {
+/// Makes the bundled icons available to GTK by name.
+fn load_icons(icon_root: Option<&std::path::Path>) {
+  if let (Some(root), Some(display)) = (icon_root, gtk::gdk::Display::default()) {
     gtk::IconTheme::for_display(&display).add_search_path(root);
   }
   gtk::Window::set_default_icon_name(icons::APP_ICON);
 
-  // Full-colour status shields instead of libadwaita's dimmed status-page icon.
-  let css = gtk::CssProvider::new();
-  css.load_from_string("statuspage.vpn-status > scrolledwindow > viewport > box > .icon { opacity: 1; filter: none; }");
-  gtk::style_context_add_provider_for_display(&display, &css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+  // Newer libadwaita draws destructive buttons tinted, which reads as disabled
+  // next to the solid "Connect"; keep the primary button solid in both states.
+  if let Some(display) = gtk::gdk::Display::default() {
+    let css = gtk::CssProvider::new();
+    css.load_from_string(
+      "button.vpn-action.destructive-action { background-color: @destructive_bg_color; color: @destructive_fg_color; }",
+    );
+    gtk::style_context_add_provider_for_display(&display, &css, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+  }
 }
 
+/// Single-page layout sized to its content (no scrolling):
+/// status header, sign-in form, then [Remember password ……… Connect].
 fn build_widgets(app: &adw::Application, settings: &Settings) -> Widgets {
   let p = &settings.profile;
 
-  // Portal row with a "recent portals" popover.
+  // Status header
+  let status_icon = gtk::Image::builder()
+    .icon_name(VpnStatus::Disconnected.icon_name(false))
+    .pixel_size(64)
+    .build();
+  let status_title = gtk::Label::builder()
+    .label(VpnStatus::Disconnected.label())
+    .css_classes(["title-2"])
+    .build();
+  let status_detail = gtk::Label::builder()
+    .label("Not connected")
+    .css_classes(["dim-label"])
+    .justify(gtk::Justification::Center)
+    .wrap(true)
+    .wrap_mode(gtk::pango::WrapMode::WordChar)
+    .lines(2)
+    .ellipsize(gtk::pango::EllipsizeMode::End)
+    .max_width_chars(42)
+    .build();
+  let status_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
+  status_box.append(&status_icon);
+  status_box.append(&status_title);
+  status_box.append(&status_detail);
+
+  // Form; the portal row has a "recent portals" popover.
   let portal = adw::EntryRow::builder().title("Portal").text(&p.portal).build();
   let recent_list = gtk::ListBox::builder()
     .selection_mode(gtk::SelectionMode::None)
@@ -699,95 +1007,88 @@ fn build_widgets(app: &adw::Application, settings: &Settings) -> Widgets {
     .text(&p.gateway)
     .build();
   let username = adw::EntryRow::builder().title("Username").text(&p.username).build();
-  let password = adw::PasswordEntryRow::builder().title("Password").build();
-  let remember = adw::SwitchRow::builder()
-    .title("Remember password")
-    .subtitle("Stored in the system keyring")
-    .active(p.remember_password)
+  let password = adw::PasswordEntryRow::builder()
+    .title("Password (empty for SSO)")
     .build();
 
-  let form = adw::PreferencesGroup::builder()
-    .description("Leave the password empty for SAML / SSO portals.")
-    .build();
+  let form = adw::PreferencesGroup::new();
   form.add(&portal);
   form.add(&gateway);
   form.add(&username);
   form.add(&password);
-  form.add(&remember);
 
+  // Footer: remember + primary action
+  let remember = gtk::CheckButton::builder()
+    .label("Remember password")
+    .tooltip_text("Store the password in the system keyring")
+    .active(p.remember_password)
+    .hexpand(true)
+    .valign(gtk::Align::Center)
+    .build();
   let action = gtk::Button::builder()
     .label("Connect")
-    .halign(gtk::Align::Center)
-    .css_classes(["pill", "suggested-action"])
+    .width_request(140)
+    .css_classes(["pill", "suggested-action", "vpn-action"])
     .build();
+  let footer = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+  footer.append(&remember);
+  footer.append(&action);
 
-  let log_view = gtk::TextView::builder()
-    .editable(false)
-    .cursor_visible(false)
-    .monospace(true)
-    .wrap_mode(gtk::WrapMode::WordChar)
-    .top_margin(6)
-    .bottom_margin(6)
-    .left_margin(6)
-    .right_margin(6)
+  let body = gtk::Box::builder()
+    .orientation(gtk::Orientation::Vertical)
+    .spacing(18)
+    .margin_top(6)
+    .margin_bottom(24)
+    .margin_start(18)
+    .margin_end(18)
     .build();
-  let log_scroller = gtk::ScrolledWindow::builder()
-    .child(&log_view)
-    .min_content_height(160)
-    .css_classes(["card"])
-    .build();
-  let log_expander = gtk::Expander::builder().label("Log").child(&log_scroller).build();
-
-  let body = gtk::Box::new(gtk::Orientation::Vertical, 18);
+  body.append(&status_box);
   body.append(&form);
-  body.append(&action);
-  body.append(&log_expander);
-
-  let status = adw::StatusPage::builder()
-    .icon_name(VpnStatus::Disconnected.icon_name(false))
-    .title(VpnStatus::Disconnected.label())
-    .css_classes(["vpn-status"])
-    .child(&adw::Clamp::builder().maximum_size(480).child(&body).build())
-    .build();
-
-  let scroller = gtk::ScrolledWindow::builder()
-    .hscrollbar_policy(gtk::PolicyType::Never)
-    .child(&status)
-    .build();
+  body.append(&footer);
 
   let menu = gio::Menu::new();
-  menu.append(Some("_Preferences"), Some("app.preferences"));
-  menu.append(Some("_Stop Other VPN Processes…"), Some("app.stop-others"));
-  menu.append(Some("_About"), Some("app.about"));
-  menu.append(Some("_Quit"), Some("app.quit"));
+  let connection = gio::Menu::new();
+  connection.append(Some("_Auto Reconnect"), Some("app.auto-reconnect"));
+  connection.append(Some("Show _Log"), Some("app.show-log"));
+  connection.append(Some("_Stop Other VPN Processes…"), Some("app.stop-others"));
+  menu.append_section(None, &connection);
+  let general = gio::Menu::new();
+  general.append(Some("_Preferences"), Some("app.preferences"));
+  general.append(Some("_About"), Some("app.about"));
+  general.append(Some("_Quit"), Some("app.quit"));
+  menu.append_section(None, &general);
   let menu_button = gtk::MenuButton::builder()
     .icon_name("open-menu-symbolic")
     .menu_model(&menu)
     .primary(true)
     .tooltip_text("Main Menu")
     .build();
-  let header = adw::HeaderBar::new();
+  let header = adw::HeaderBar::builder().show_title(false).build();
   header.pack_end(&menu_button);
 
   let toasts = adw::ToastOverlay::new();
-  toasts.set_child(Some(&scroller));
+  toasts.set_child(Some(&adw::Clamp::builder().maximum_size(440).child(&body).build()));
 
   let view = adw::ToolbarView::new();
   view.add_top_bar(&header);
   view.set_content(Some(&toasts));
 
+  // No default height: the window takes the natural height of its content.
   let window = adw::ApplicationWindow::builder()
     .application(app)
     .title("GlobalProtect")
-    .default_width(460)
-    .default_height(720)
+    .default_width(420)
     .content(&view)
     .build();
+  // Start on the button so the portal text is not pre-selected.
+  GtkWindowExt::set_focus(&window, Some(&action));
 
   Widgets {
     window,
     toasts,
-    status,
+    status_icon,
+    status_title,
+    status_detail,
     form,
     portal,
     recent_list,
@@ -797,6 +1098,5 @@ fn build_widgets(app: &adw::Application, settings: &Settings) -> Widgets {
     password,
     remember,
     action,
-    log_view,
   }
 }
