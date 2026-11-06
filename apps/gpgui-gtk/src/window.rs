@@ -171,10 +171,8 @@ impl App {
         let Some(this) = weak.upgrade() else { break };
         match cmd {
           TrayCommand::ShowWindow => this.show(),
-          TrayCommand::Connect => {
-            this.show();
-            this.connect();
-          }
+          // Connect in the background; the window only opens when input is needed.
+          TrayCommand::Connect => this.connect(),
           TrayCommand::Disconnect => this.disconnect(),
           TrayCommand::Quit => this.request_quit(),
         }
@@ -248,6 +246,12 @@ impl App {
     let toast = adw::Toast::new(message);
     toast.set_timeout(6);
     self.w.toasts.add_toast(toast);
+    // Hidden window (tray-only use): toasts would go unseen, use a desktop notification.
+    if !self.w.window.is_visible() {
+      let notification = gio::Notification::new("GlobalProtect VPN");
+      notification.set_body(Some(message));
+      self.app.send_notification(Some("status"), &notification);
+    }
   }
 
   // ---- actions & signals ---------------------------------------------------
@@ -493,6 +497,7 @@ impl App {
     }
     let portal = self.w.portal.text().trim().to_owned();
     if portal.is_empty() {
+      self.show();
       self.toast("Enter a portal address");
       self.w.portal.grab_focus();
       return;
