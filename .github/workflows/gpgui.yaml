@@ -81,8 +81,9 @@ jobs:
         with:
           key: linux-${{ matrix.arch }}
 
+      # Release profile: shares compiled dependencies with the build below.
       - name: Test
-        run: cargo test --locked -p gpdesktop -p gpgui-gtk
+        run: cargo test --release --locked -p gpdesktop -p gpgui-gtk
 
       - name: Build release binaries
         run: cargo build --release --locked -p gpservice -p gpclient -p gpauth -p gpgui-gtk
@@ -150,11 +151,26 @@ jobs:
         shell: pwsh
     steps:
       - uses: actions/checkout@v4
+
+      # Windows only builds OpenConnect from source; libxml2 comes from MSYS2.
+      - name: Fetch the OpenConnect submodule
+        id: oc
+        run: |
+          git submodule update --init --depth 1 crates/openconnect/deps/openconnect
+          if ($LASTEXITCODE) { throw 'git submodule update failed' }
+          "sha=$(git rev-parse HEAD:crates/openconnect/deps/openconnect)" >> $env:GITHUB_OUTPUT
+
+      # The native library only changes with the submodule or its build scripts.
+      - uses: actions/cache@v4
+        id: oc-cache
         with:
-          submodules: recursive
+          # Outside target/ so rust-cache neither stores nor prunes it.
+          path: .ci-native/${{ matrix.arch }}
+          key: openconnect-${{ matrix.arch }}-${{ steps.oc.outputs.sha }}-${{ hashFiles('scripts/build-openconnect-windows.*') }}
 
       - uses: msys2/setup-msys2@v2
         id: msys2
+        if: steps.oc-cache.outputs.cache-hit != 'true'
         with:
           msystem: ${{ matrix.msystem }}
           update: true
@@ -164,6 +180,8 @@ jobs:
 
       - name: Install NSIS
         run: |
+          $preinstalled = @("${env:ProgramFiles(x86)}\NSIS\makensis.exe", "$env:ProgramFiles\NSIS\makensis.exe") | Where-Object { Test-Path $_ }
+          if ($preinstalled) { Write-Host "Using $($preinstalled[0])"; exit 0 }
           choco install nsis --version=3.12.0 --yes --no-progress
           if ($LASTEXITCODE -ne 0) { throw 'Installing NSIS failed.' }
 
@@ -176,14 +194,16 @@ jobs:
         with:
           key: windows-${{ matrix.arch }}
 
+      # Release profile: shares compiled dependencies with the installer build.
       - name: Test
-        run: cargo test --locked -p gpdesktop -p gpgui-win
+        run: cargo test --release --locked -p gpdesktop -p gpgui-win
 
+      # -SkipNative reuses the cached OpenConnect and builds it only when missing.
       - name: Build installer
         env:
           MSYS_ROOT: ${{ steps.msys2.outputs.msys2-location }}
         run: |
-          ./scripts/build-gpgui-win.ps1 -Arch ${{ matrix.arch }} -MsysRoot $env:MSYS_ROOT -MsysSubsystem ${{ matrix.subsystem }}
+          ./scripts/build-gpgui-win.ps1 -Arch ${{ matrix.arch }} -MsysRoot "$env:MSYS_ROOT" -MsysSubsystem ${{ matrix.subsystem }} -Prefix "$env:GITHUB_WORKSPACE\.ci-native\${{ matrix.arch }}" -SkipNative
           if ($LASTEXITCODE) { throw "build-gpgui-win.ps1 failed ($LASTEXITCODE)" }
           $setup = Get-ChildItem target/windows-oss/GlobalProtectVPN-*-${{ matrix.arch }}-setup.exe | Select-Object -First 1
           $hash = (Get-FileHash $setup).Hash.ToLower()
