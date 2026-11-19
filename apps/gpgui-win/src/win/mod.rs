@@ -1178,6 +1178,9 @@ fn apply_demo(demo: &str) -> Vec<Effect> {
         tx,
       )));
     }
+    "form" => {
+      with_app(|app| app.main.set_portal("vpn.example.com"));
+    }
     _ => {}
   }
   with_app(|app| {
