@@ -42,8 +42,11 @@ cargo build -p gpgui-win
 
 # Full package: OpenConnect, gpservice, gpauth, gpgui-win and the installer
 powershell -ExecutionPolicy Bypass -File scripts\build-gpgui-win.ps1
-# -> target\windows-oss\GlobalProtectVPN-<version>-x64-setup.exe
+# -> target\windows-oss\GlobalProtectVPN-<version>-<x64|arm64>-setup.exe
 ```
+
+The script builds for the host architecture: x64 uses MSYS2 UCRT64, ARM64 (Windows 11 on ARM)
+uses MSYS2 CLANGARM64 and the Visual Studio ARM64 tools.
 
 The installer (`packaging/windows-oss`) registers the same `GPConnect` service as GP Connect,
 so it refuses to install while GP Connect is installed. Binaries are not code-signed.
