@@ -1,0 +1,48 @@
+[package]
+name = "gpgui-win"
+rust-version.workspace = true
+authors.workspace = true
+version.workspace = true
+edition.workspace = true
+license = "GPL-3.0"
+description = "Open-source native Windows GUI (Win32 + Direct2D) for GlobalProtect-openconnect"
+
+[[bin]]
+name = "gpgui-win"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+gpdesktop = { path = "../../crates/gpdesktop" }
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
+png = "0.18"
+windows-numerics = "0.3"
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Direct2D",
+  "Win32_Graphics_Direct2D_Common",
+  "Win32_Graphics_DirectWrite",
+  "Win32_Graphics_Dwm",
+  "Win32_Graphics_Dxgi_Common",
+  "Win32_Graphics_Gdi",
+  "Win32_Graphics_Imaging",
+  "Win32_Security",
+  "Win32_Storage_Xps",
+  "Win32_System_Com",
+  "Win32_System_DataExchange",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Memory",
+  "Win32_System_Ole",
+  "Win32_System_Registry",
+  "Win32_System_Threading",
+  "Win32_UI_Controls",
+  "Win32_UI_HiDpi",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+embed-resource = "3"

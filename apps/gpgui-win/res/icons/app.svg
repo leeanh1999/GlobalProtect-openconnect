@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#62a0ea"/>
+      <stop offset="1" stop-color="#1c71d8"/>
+    </linearGradient>
+    <linearGradient id="shield" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#deddda"/>
+    </linearGradient>
+    <linearGradient id="hole" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3584e4"/>
+      <stop offset="1" stop-color="#1a5fb4"/>
+    </linearGradient>
+  </defs>
+  <!-- base plate with GNOME-style bottom edge -->
+  <rect x="8" y="14" width="112" height="106" rx="24" fill="#1a5fb4"/>
+  <rect x="8" y="8" width="112" height="106" rx="24" fill="url(#bg)"/>
+  <path d="M32 8h64a24 24 0 0 1 24 24v6H8v-6A24 24 0 0 1 32 8z" fill="#fff" opacity=".12"/>
+  <!-- orbit (globe) behind the shield -->
+  <ellipse cx="64" cy="62" rx="46" ry="17" fill="none" stroke="#99c1f1" stroke-width="4" opacity=".55" transform="rotate(-20 64 62)"/>
+  <!-- shield -->
+  <path d="M64 22l30 10.5v22.5c0 20-12.6 34.6-30 42.5c-17.4-7.9-30-22.5-30-42.5V32.5z" fill="#0b3b7a" opacity=".25" transform="translate(0 4)"/>
+  <path d="M64 22l30 10.5v22.5c0 20-12.6 34.6-30 42.5c-17.4-7.9-30-22.5-30-42.5V32.5z" fill="url(#shield)"/>
+  <path d="M64 22v75.5c-17.4-7.9-30-22.5-30-42.5V32.5z" fill="#fff" opacity=".6"/>
+  <!-- keyhole -->
+  <circle cx="64" cy="53" r="10" fill="url(#hole)"/>
+  <path d="M59 58h10l3 18H56z" fill="url(#hole)"/>
+</svg>

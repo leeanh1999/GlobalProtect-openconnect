@@ -6,6 +6,7 @@ members = [
   "apps/gpclient",
   "apps/gpservice",
   "apps/gpauth",
+  "apps/gpgui-win",
   "apps/gpgui-helper/src-tauri",
 ]
 

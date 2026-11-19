@@ -2253,6 +2253,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpdesktop"
+version = "3.5.0"
+dependencies = [
+ "anyhow",
+ "common",
+ "directories",
+ "env_logger",
+ "futures-util",
+ "gpapi",
+ "log",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite 0.30.0",
+ "tokio-util",
+ "uuid",
+ "windows-sys 0.61.2",
+ "zeroize",
+]
+
+[[package]]
 name = "gpgui-helper"
 version = "3.5.0"
 dependencies = [
@@ -2271,6 +2292,21 @@ dependencies = [
  "tokio-tungstenite 0.30.0",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "gpgui-win"
+version = "3.5.0"
+dependencies = [
+ "anyhow",
+ "embed-resource",
+ "env_logger",
+ "gpdesktop",
+ "log",
+ "png",
+ "tokio",
+ "windows",
+ "windows-numerics",
 ]
 
 [[package]]
