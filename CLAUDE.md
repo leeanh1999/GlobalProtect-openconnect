@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 GlobalProtect VPN client built on OpenConnect (Rust workspace, edition 2024, toolchain pinned to 1.91 via `rust-toolchain.toml`). Targets Windows (x64/ARM64), macOS (Apple silicon), Linux, FreeBSD, OpenBSD. `gpclient` (CLI) does not build on Windows; on Windows the tunnel runs inside the `GPConnect` service (`gpservice`).
 
-The official GP Connect desktop GUI (`gpgui`) and Windows `gp-posture.exe` are proprietary (private repo). This fork adds open-source GUIs: `apps/gpgui-win` (Windows, Win32 + Direct2D; branch `windows-gui`) and `apps/gpgui-gtk` (Linux, branch `gtk-gui`), both called "GlobalProtect VPN", sharing logic in `crates/gpdesktop`.
+The official GP Connect desktop GUI (`gpgui`) and Windows `gp-posture.exe` are proprietary (private repo). This fork adds open-source GUIs: `apps/gpgui-win` (Windows, Win32 + Direct2D) and `apps/gpgui-gtk` (Linux/BSD, GTK4/libadwaita), both called "GlobalProtect VPN", sharing sign-in and settings in `crates/gpdesktop`. Each is a stub binary on the other OS so `cargo check --workspace` works everywhere. CI: `.github/workflows/gpgui.yaml` builds Linux tarballs and the Windows installer; pushing a `gui-v*` (or `gtk-v*`) tag publishes a release. Upstream's `build.yaml` needs the private gpgui repo and always fails on this fork.
 
 ### Windows build (this machine)
 
