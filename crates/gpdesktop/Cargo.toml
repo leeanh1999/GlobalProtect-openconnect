@@ -1,0 +1,38 @@
+[package]
+name = "gpdesktop"
+rust-version.workspace = true
+authors.workspace = true
+version.workspace = true
+edition.workspace = true
+license = "GPL-3.0"
+description = "UI-agnostic desktop client core (sign-in, gpservice client, reconnect controller) shared by the open-source GUIs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+directories.workspace = true
+log.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "process", "io-util", "net", "sync", "time"] }
+tokio-util.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+zeroize.workspace = true
+common = { path = "../common" }
+gpapi = { path = "../gpapi" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Credentials",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_Threading",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+env_logger.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
