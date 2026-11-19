@@ -56,6 +56,16 @@ jobs:
 
       - name: Install system dependencies
         run: |
+          # The x86_64 image points at an EC2 regional mirror that often stalls
+          # (~30 s timeout per package, 35+ min in total). Use the Azure mirror,
+          # fail fast and retry. ports.ubuntu.com (aarch64) is left as is.
+          for f in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list; do
+            [ -f "$f" ] && sudo sed -Ei 's#https?://[a-z0-9.-]*archive\.ubuntu\.com/ubuntu#http://azure.archive.ubuntu.com/ubuntu#g' "$f"
+          done
+          printf 'Acquire::Retries "5";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' | sudo tee /etc/apt/apt.conf.d/99ci-network >/dev/null
+          # Skip man page index rebuilds while installing.
+          echo 'man-db man-db/auto-update boolean false' | sudo debconf-set-selections
+          sudo rm -f /var/lib/man-db/auto-update
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential pkg-config patch \
